@@ -1,0 +1,67 @@
+version: "3.9"
+name: darkmoon-stack
+
+volumes:
+  zap-data: {}
+
+services:
+  zap:
+    image: ghcr.io/zaproxy/zaproxy:weekly
+    container_name: zap
+    user: "0:0"
+    environment:
+      ZAP_PORT: "8888"
+    volumes:
+      - zap-data:/zap/wrk
+    command: >
+      sh -lc '
+        set -eu
+        if [ -z "$${ZAP_API_TOKEN:-}" ]; then
+          TOKEN="$$(head -c 32 /dev/urandom | od -An -tx1 | tr -d " \n")"
+        else
+          TOKEN="$${ZAP_API_TOKEN}"
+        fi
+        export ZAP_API_TOKEN="$$TOKEN"
+        mkdir -p /zap/wrk
+        printf "%s" "$$TOKEN" > /zap/wrk/ZAP-API-TOKEN
+        printf "ZAP_API_TOKEN=%s\n" "$$TOKEN" > /zap/wrk/zap.env
+        printf "ZAP-API-TOKEN=%s\n" "$$TOKEN" > /zap/wrk/zap.env.hyphen
+        echo "[ZAP] API token: $$TOKEN"
+        echo "[ZAP] Proxy/API sur 0.0.0.0:8888"
+        exec /zap/zap.sh \
+          -daemon \
+          -host 0.0.0.0 \
+          -port 8888 \
+          -config api.key="$$TOKEN" \
+          -config api.addrs.addr.name=.* \
+          -config api.addrs.addr.regex=true
+      '
+    healthcheck:
+      test: ["CMD-SHELL", "if command -v curl >/dev/null 2>&1; then curl -sf http://127.0.0.1:${ZAP_PORT:-8888}/JSON/core/view/version/ >/dev/null || exit 1; else wget -qO- http://127.0.0.1:${ZAP_PORT:-8888}/JSON/core/view/version/ >/dev/null || exit 1; fi"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+
+    ports:
+      - "8888:8888"
+    restart: unless-stopped
+
+  darkmoon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: darkmoon
+    user: "0:0"
+    volumes:
+      - ${HOME}/darkmoon-docker-fs:/opt/darkmoon
+      - zap-data:/zap/wrk:ro
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    environment:
+      - DM_MODE=default
+    depends_on:
+      zap:
+        condition: service_started
+    restart: unless-stopped
