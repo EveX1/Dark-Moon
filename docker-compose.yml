@@ -54,7 +54,8 @@ services:
     container_name: darkmoon
     user: "0:0"
     volumes:
-      - ${HOME}/darkmoon-docker-fs:/opt/darkmoon
+      - ./prompt:/opt/darkmoon/prompt:ro
+      - ./zap_cli_out:/opt/darkmoon/zap_cli_out
       - zap-data:/zap/wrk:ro
     cap_add:
       - NET_RAW
