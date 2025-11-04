@@ -1,5 +1,5 @@
 # ========= STAGE 1: builder (Go 1.24) =========
-FROM golang:1.24-bookworm AS builder
+FROM golang:1.25.3-bookworm AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /build
 ENV OUT=/out
@@ -36,6 +36,17 @@ RUN chmod +x ./setup.sh \
  && sed -i -E 's/(apt( |-)?get install -y[^#\n]*)\s+(golang(-go|-doc|-src)?)(\s|$)/\1 /g' setup.sh \
  && bash -x ./setup.sh
 
+# ---- Nuclei templates (builder) -> /out/nuclei-templates ----
+RUN set -eux; \
+  NUCLEI_BIN="$(command -v nuclei || true)"; \
+  install -d "${OUT}/nuclei-templates"; \
+  if [ -x "$NUCLEI_BIN" ]; then \
+    "$NUCLEI_BIN" -silent -update-templates -ut "${OUT}/nuclei-templates" || true; \
+  else \
+    echo "nuclei non trouvé (build setup.sh ?), skip templates"; \
+  fi; \
+  test -d "${OUT}/nuclei-templates" && ls -1 "${OUT}/nuclei-templates" | head -n 5 || true
+
 # ---- Ruby 3.3.5 -> /opt/darkmoon/ruby ----
 ARG RUBY_VER=3.3.5
 ARG RUBY_PREFIX=/opt/darkmoon/ruby
@@ -48,6 +59,20 @@ RUN set -eux; \
 ENV PATH="${RUBY_PREFIX}/bin:${PATH}" \
     GEM_HOME="${RUBY_PREFIX}/lib/ruby/gems/3.3.0" \
     GEM_PATH="${RUBY_PREFIX}/lib/ruby/gems/3.3.0"
+
+# ---- Python 3.12.x -> /opt/darkmoon/python ----
+ARG PY_VER=3.12.6
+ARG PY_PREFIX=/opt/darkmoon/python
+RUN set -eux; \
+  curl -fsSL https://www.python.org/ftp/python/${PY_VER}/Python-${PY_VER}.tgz -o python.tgz; \
+  tar -xzf python.tgz; cd Python-${PY_VER}; \
+  ./configure --prefix=${PY_PREFIX} --enable-optimizations --with-ensurepip=install; \
+  make -j"$(nproc)"; make install; \
+  ${PY_PREFIX}/bin/python3 -V; ${PY_PREFIX}/bin/pip3 -V
+
+# (Optionnel) Pré-installer les paquets Python ici pour gagner du temps à l’image finale,
+# sinon laisse setup_py.sh le faire au runtime.
+# RUN ${PY_PREFIX}/bin/pip3 install --no-cache-dir 'impacket==0.12.0' 'netexec==1.10.2' 'bloodhound==1.7.2'
 
 # Patch CVE Ruby (cgi/uri/rexml/net-imap) et purge des gemspec vulnérables par défaut
 RUN set -eux; \
@@ -179,10 +204,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Base minimale + kdig (alias dig) + libs runtime requises
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates tzdata bash knot-dnsutils \
+      ca-certificates tzdata bash dnsutils \
       libssl3 zlib1g libnghttp2-14 libidn2-0 libpsl5 libkrb5-3 libssh2-1 \
       libstdc++6 libgcc-s1 libyaml-0-2 libreadline8 libffi8 libgmp10 libncursesw6 \
- && ln -sf /usr/bin/kdig /usr/local/bin/dig \
+      libpcap0.8 \
  && rm -rf /var/lib/apt/lists/*
 
 # ----- COPIES DIRECTES depuis /out (builder) -----
@@ -198,6 +223,28 @@ COPY --from=builder /out/bin/ZAP-CLI      /usr/local/bin/ZAP-CLI
 COPY --from=builder /out/curl     /opt/darkmoon/curl
 COPY --from=builder /opt/darkmoon/ruby /opt/darkmoon/ruby 
 COPY --from=builder /out/whatweb  /opt/darkmoon/whatweb
+
+# ----- Python runtime -----
+COPY --from=builder /opt/darkmoon/python /opt/darkmoon/python
+ENV PATH="/opt/darkmoon/python/bin:${PATH}"
+
+# ----- Setup des outils Python (impacket, netexec, bloodhound) -----
+COPY setup_py.sh /setup_py.sh
+RUN chmod +x /setup_py.sh && /setup_py.sh || true
+
+# ----- Nuclei templates (runtime) -----
+COPY --from=builder /out/nuclei-templates /opt/darkmoon/nuclei-templates
+ENV NUCLEI_TEMPLATES="/opt/darkmoon/nuclei-templates"
+
+COPY --from=builder /out/bin/naabu            /usr/local/bin/naabu
+COPY --from=builder /out/bin/httpx            /usr/local/bin/httpx
+COPY --from=builder /out/bin/nuclei           /usr/local/bin/nuclei
+COPY --from=builder /out/bin/zgrab2           /usr/local/bin/zgrab2
+COPY --from=builder /out/bin/katana           /usr/local/bin/katana
+COPY --from=builder /out/bin/kubescape        /usr/local/bin/kubescape
+COPY --from=builder /out/bin/kubectl-who-can  /usr/local/bin/kubectl-who-can
+COPY --from=builder /out/bin/kubeletctl       /usr/local/bin/kubeletctl
+COPY --from=builder /out/bin/rbac-police      /usr/local/bin/rbac-police
 
 # Sanity (évite de re-découvrir à l’exec)
 RUN set -eux; \
@@ -237,28 +284,31 @@ ENV GEM_HOME="/opt/darkmoon/ruby/lib/ruby/gems/3.3.0" \
 
 # Self-check (tolérant)
 RUN set -eux; \
-  # 1) Présence des binaires
-  for b in /usr/local/bin/nmap /usr/local/bin/dirb /usr/local/bin/waybackurls /usr/local/bin/whatweb /usr/local/bin/dig; do \
+  # 1) Présence des binaires principaux (chemins connus)
+  for b in /usr/local/bin/nmap /usr/local/bin/dirb /usr/local/bin/waybackurls /usr/local/bin/whatweb; do \
     [ -x "$b" ] || { echo "MISSING $b" >&2; exit 1; }; \
   done; \
-  # 2) Sanity rapides (ne pas faire échouer sur des retours non-0 connus)
+  # 2) Sanity rapides
   nmap -V >/dev/null; \
   dirb -h >/dev/null || true; \
   waybackurls -h >/dev/null; \
-    # 3) WhatWeb : env propre
-    env -i \
+  # 3) WhatWeb : env propre
+  env -i \
     PATH="/opt/darkmoon/ruby/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     GEM_HOME="/opt/darkmoon/ruby/lib/ruby/gems/3.3.0" \
     GEM_PATH="/opt/darkmoon/ruby/lib/ruby/gems/3.3.0" \
     /opt/darkmoon/ruby/bin/ruby /opt/darkmoon/whatweb/whatweb -v >/dev/null \
-    || env -i \
+  || env -i \
     PATH="/opt/darkmoon/ruby/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     GEM_HOME="/opt/darkmoon/ruby/lib/ruby/gems/3.3.0" \
     GEM_PATH="/opt/darkmoon/ruby/lib/ruby/gems/3.3.0" \
     /opt/darkmoon/ruby/bin/ruby /opt/darkmoon/whatweb/whatweb -h >/dev/null \
-    || true; \
-  # 4) DNS check best effort
-  dig +short example.com @1.1.1.1 >/dev/null || true
+  || true; \
+  # 4) DNS check (si dig présent)
+  DIG_BIN="$(command -v dig || true)"; \
+  if [ -n "$DIG_BIN" ]; then "$DIG_BIN" +short example.com @1.1.1.1 >/dev/null || true; \
+  else echo '[WARN] dig absent (dnsutils non installé ?), skip DNS check'; fi
+
 
 
 
@@ -279,7 +329,7 @@ COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 ENV DM_HOME=/opt/darkmoon
-ENV PATH="$DM_HOME:$DM_HOME/kube:$PATH"
+ENV PATH="/opt/darkmoon/python/bin:/opt/darkmoon/curl/bin:/opt/darkmoon/ruby/bin:/opt/darkmoon:${DM_HOME}/kube:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 WORKDIR /opt/darkmoon
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["bash", "-lc", "sleep infinity"]
