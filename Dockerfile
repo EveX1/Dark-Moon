@@ -166,6 +166,14 @@ RUN set -eux; \
   make -j"$(nproc)"; make install; \
   ${OUT}/bin/nmap -V
 
+# ---- kubectl CLI -> /out/bin/kubectl ----
+ARG KUBECTL_VER=v1.30.2
+RUN set -eux; \
+  install -d ${OUT}/bin; \
+  curl -fsSLo ${OUT}/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VER}/bin/linux/amd64/kubectl"; \
+  chmod +x ${OUT}/bin/kubectl; \
+  ${OUT}/bin/kubectl version --client --output=yaml || true
+
 # ---- waybackurls (Go) -> /out/bin/waybackurls ----
 RUN set -eux; \
   install -d ${OUT}/bin; \
@@ -215,9 +223,16 @@ RUN apt-get update \
 COPY --from=builder /out/bin/nmap         /usr/local/bin/nmap
 COPY --from=builder /out/bin/dirb         /usr/local/bin/dirb
 COPY --from=builder /out/bin/waybackurls  /usr/local/bin/waybackurls
-COPY --from=builder /out/bin/agentfactory /usr/local/bin/agentfactory
-COPY --from=builder /out/bin/mcp          /usr/local/bin/mcp
-COPY --from=builder /out/bin/ZAP-CLI      /usr/local/bin/ZAP-CLI
+COPY --from=builder /out/bin/kubectl      /usr/local/bin/kubectl
+# ----- AGENTFACTORY / MCP / ZAP-CLI : sous /opt/darkmoon + symlinks -----
+COPY --from=builder /out/bin/agentfactory /opt/darkmoon/agentfactory
+COPY --from=builder /out/bin/mcp          /opt/darkmoon/mcp
+COPY --from=builder /out/bin/ZAP-CLI      /opt/darkmoon/ZAP-CLI
+
+RUN ln -s /opt/darkmoon/agentfactory /usr/local/bin/agentfactory \
+ && ln -s /opt/darkmoon/mcp          /usr/local/bin/mcp \
+ && ln -s /opt/darkmoon/ZAP-CLI      /usr/local/bin/ZAP-CLI
+
 
 # ----- ARTEFACTS CUSTOM (MANQUAIT) -----
 COPY --from=builder /out/curl     /opt/darkmoon/curl
@@ -236,15 +251,30 @@ RUN chmod +x /setup_py.sh && /setup_py.sh || true
 COPY --from=builder /out/nuclei-templates /opt/darkmoon/nuclei-templates
 ENV NUCLEI_TEMPLATES="/opt/darkmoon/nuclei-templates"
 
-COPY --from=builder /out/bin/naabu            /usr/local/bin/naabu
-COPY --from=builder /out/bin/httpx            /usr/local/bin/httpx
-COPY --from=builder /out/bin/nuclei           /usr/local/bin/nuclei
-COPY --from=builder /out/bin/zgrab2           /usr/local/bin/zgrab2
-COPY --from=builder /out/bin/katana           /usr/local/bin/katana
-COPY --from=builder /out/bin/kubescape        /usr/local/bin/kubescape
-COPY --from=builder /out/bin/kubectl-who-can  /usr/local/bin/kubectl-who-can
-COPY --from=builder /out/bin/kubeletctl       /usr/local/bin/kubeletctl
-COPY --from=builder /out/bin/rbac-police      /usr/local/bin/rbac-police
+# ====== Kube / Web recon tools sous /opt/darkmoon/kube ======
+RUN mkdir -p /opt/darkmoon/kube
+
+# On range les binaires dans $DM_HOME/kube
+COPY --from=builder /out/bin/naabu           /opt/darkmoon/kube/naabu
+COPY --from=builder /out/bin/httpx           /opt/darkmoon/kube/httpx
+COPY --from=builder /out/bin/nuclei          /opt/darkmoon/kube/nuclei
+COPY --from=builder /out/bin/zgrab2          /opt/darkmoon/kube/zgrab2
+COPY --from=builder /out/bin/katana          /opt/darkmoon/kube/katana
+COPY --from=builder /out/bin/kubescape       /opt/darkmoon/kube/kubescape
+COPY --from=builder /out/bin/kubectl-who-can /opt/darkmoon/kube/kubectl-who-can
+COPY --from=builder /out/bin/kubeletctl      /opt/darkmoon/kube/kubeletctl
+COPY --from=builder /out/bin/rbac-police     /opt/darkmoon/kube/rbac-police
+
+# (Optionnel mais pratique) symlinks vers /usr/local/bin pour pouvoir les lancer partout
+RUN ln -s /opt/darkmoon/kube/naabu           /usr/local/bin/naabu           \
+ && ln -s /opt/darkmoon/kube/httpx           /usr/local/bin/httpx           \
+ && ln -s /opt/darkmoon/kube/nuclei          /usr/local/bin/nuclei          \
+ && ln -s /opt/darkmoon/kube/zgrab2          /usr/local/bin/zgrab2          \
+ && ln -s /opt/darkmoon/kube/katana          /usr/local/bin/katana          \
+ && ln -s /opt/darkmoon/kube/kubescape       /usr/local/bin/kubescape       \
+ && ln -s /opt/darkmoon/kube/kubectl-who-can /usr/local/bin/kubectl-who-can \
+ && ln -s /opt/darkmoon/kube/kubeletctl      /usr/local/bin/kubeletctl      \
+ && ln -s /opt/darkmoon/kube/rbac-police     /usr/local/bin/rbac-police
 
 # Sanity (évite de re-découvrir à l’exec)
 RUN set -eux; \

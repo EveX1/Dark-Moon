@@ -55,8 +55,10 @@ services:
     user: "0:0"
     volumes:
       - ./prompt:/opt/darkmoon/prompt:ro
-      - ./zap_cli_out:/opt/darkmoon/zap_cli_out
+      - ${HOME}/darkmoon-docker-fs:/opt/darkmoon/zap_cli_out
+      - ${HOME}/darkmoon-docker-fs:/opt/darkmoon/out
       - zap-data:/zap/wrk:ro
+      - ~/.kube:/root/.kube:ro
     cap_add:
       - NET_RAW
       - NET_ADMIN
