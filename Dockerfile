@@ -9,7 +9,40 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential curl git unzip ca-certificates pkg-config autoconf automake libtool \
     libssl-dev zlib1g-dev libnghttp2-dev libidn2-0-dev libpsl-dev libkrb5-dev libssh2-1-dev \
     nlohmann-json3-dev make file libreadline-dev libyaml-dev \
+    \
+    # 🔥 Dépendances nécessaires pour les modules Python manquants
+    libbz2-dev \
+    libsqlite3-dev \
+    libffi-dev \
+    liblzma-dev \
+    libgdbm-dev \
+    libnss3-dev \
+    libncurses-dev \
+    uuid-dev \
  && rm -rf /var/lib/apt/lists/*
+
+# ---- kube-bench (build local avec Go 1.25.3) -> /out/bin/kube-bench ----
+RUN set -eux; \
+  install -d "${OUT}/bin"; \
+  # on installe le binaire directement depuis le module racine
+  GOBIN="${OUT}/bin" go install github.com/aquasecurity/kube-bench@v0.14.0; \
+  # sanity check (non bloquant, juste pour loguer la version)
+  "${OUT}/bin/kube-bench" --version || true
+
+# ---- grpcurl (build local + deps patchées) -> /out/bin/grpcurl ----
+RUN set -eux; \
+  git clone --depth=1 https://github.com/fullstorydev/grpcurl.git /tmp/grpcurl-src; \
+  cd /tmp/grpcurl-src; \
+  # ⚠️ On force les versions qui corrigent les CVE :
+  #   - golang.org/x/oauth2 >= 0.27.0  (CVE-2025-22868)
+  #   - golang.org/x/net    >= 0.38.0  (CVE-2025-22870 / 22872)
+  go get golang.org/x/oauth2@v0.27.0 golang.org/x/net@v0.38.0; \
+  go mod tidy; \
+  # On installe le binaire dans /out/bin comme pour kubectl / kube-bench
+  GOBIN="${OUT}/bin" go install ./cmd/grpcurl; \
+  "${OUT}/bin/grpcurl" --version || true; \
+  rm -rf /tmp/grpcurl-src
+
 
 # Go toolchain
 ENV GOTOOLCHAIN=auto GO111MODULE=on GOWORK=off \
@@ -46,6 +79,9 @@ RUN set -eux; \
     echo "nuclei non trouvé (build setup.sh ?), skip templates"; \
   fi; \
   test -d "${OUT}/nuclei-templates" && ls -1 "${OUT}/nuclei-templates" | head -n 5 || true
+
+ENV NUCLEI_TEMPLATES=/opt/darkmoon/nuclei-templates
+
 
 # ---- Ruby 3.3.5 -> /opt/darkmoon/ruby ----
 ARG RUBY_VER=3.3.5
@@ -85,6 +121,14 @@ RUN set -eux; \
     'net-imap:>=0.5.7'; \
   d="${RUBY_PREFIX}/lib/ruby/gems/3.3.0/specifications/default"; \
   rm -f "$d/cgi-0.4.1.gemspec" "$d/uri-0.13.1.gemspec" "$d/rexml-3.3.6.gemspec" "$d/net-imap-0.4.9.1.gemspec" || true
+
+# ---- NetExec (nxc) installé comme dans la doc (depuis GitHub) ----
+# Equivalent "pipx install git+https://github.com/Pennyw0rth/NetExec"
+RUN set -eux; \
+  /opt/darkmoon/python/bin/pip3 install --no-cache-dir \
+    "git+https://github.com/Pennyw0rth/NetExec.git@v1.4.0" ; \
+  echo "=== NetExec binaries dans /opt/darkmoon/python/bin ==="; \
+  ls -l /opt/darkmoon/python/bin | egrep -i 'nxc|netexec' || true
 
 # WhatWeb (sources) -> /out/whatweb
 RUN git clone --depth=1 https://github.com/urbanadventurer/whatweb ${OUT}/whatweb
@@ -166,13 +210,24 @@ RUN set -eux; \
   make -j"$(nproc)"; make install; \
   ${OUT}/bin/nmap -V
 
-# ---- kubectl CLI -> /out/bin/kubectl ----
-ARG KUBECTL_VER=v1.30.2
+# ---- kubectl CLI recompilé avec un Go récent -> /out/bin/kubectl ----
+ARG KUBECTL_VER=v1.34.2
 RUN set -eux; \
-  install -d ${OUT}/bin; \
-  curl -fsSLo ${OUT}/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VER}/bin/linux/amd64/kubectl"; \
-  chmod +x ${OUT}/bin/kubectl; \
-  ${OUT}/bin/kubectl version --client --output=yaml || true
+  install -d "${OUT}/bin"; \
+  arch="$(uname -m)"; \
+  case "$arch" in \
+    x86_64|amd64) kubectl_arch=amd64 ;; \
+    aarch64|arm64) kubectl_arch=arm64 ;; \
+    *) echo >&2 "Architecture $arch non supportée pour kubectl"; exit 1 ;; \
+  esac; \
+  # On suit la méthode officielle: binaire précompilé depuis dl.k8s.io
+  curl -fsSLo "${OUT}/bin/kubectl" \
+    "https://dl.k8s.io/release/${KUBECTL_VER}/bin/linux/${kubectl_arch}/kubectl"; \
+  chmod +x "${OUT}/bin/kubectl"; \
+  # Sanity check non bloquant
+  "${OUT}/bin/kubectl" version --client --output=yaml || true
+
+
 
 # ---- waybackurls (Go) -> /out/bin/waybackurls ----
 RUN set -eux; \
@@ -216,6 +271,9 @@ RUN apt-get update \
       libssl3 zlib1g libnghttp2-14 libidn2-0 libpsl5 libkrb5-3 libssh2-1 \
       libstdc++6 libgcc-s1 libyaml-0-2 libreadline8 libffi8 libgmp10 libncursesw6 \
       libpcap0.8 \
+      hydra \
+      snmp \
+      openssh-client \
  && rm -rf /var/lib/apt/lists/*
 
 # ----- COPIES DIRECTES depuis /out (builder) -----
@@ -235,17 +293,34 @@ RUN ln -s /opt/darkmoon/agentfactory /usr/local/bin/agentfactory \
 
 
 # ----- ARTEFACTS CUSTOM (MANQUAIT) -----
-COPY --from=builder /out/curl     /opt/darkmoon/curl
+# cURL custom : binaire + libs
+COPY --from=builder /out/curl /opt/darkmoon/curl
+
+# On met son bin dans le PATH
+ENV PATH="/opt/darkmoon/curl/bin:${PATH}"
+
+# On annonce où sont les libs à l’éditeur de liens dynamique
+ENV LD_LIBRARY_PATH="/opt/darkmoon/curl/lib:${LD_LIBRARY_PATH:-}"
+
 COPY --from=builder /opt/darkmoon/ruby /opt/darkmoon/ruby 
 COPY --from=builder /out/whatweb  /opt/darkmoon/whatweb
+
+# kube-bench construit localement
+COPY --from=builder /out/bin/kube-bench /usr/local/bin/kube-bench
+# grpcurl compilé localement
+COPY --from=builder /out/bin/grpcurl /usr/local/bin/grpcurl
 
 # ----- Python runtime -----
 COPY --from=builder /opt/darkmoon/python /opt/darkmoon/python
 ENV PATH="/opt/darkmoon/python/bin:${PATH}"
 
+# Sanity check NetExec dans le runtime (log only)
+RUN set -eux; \
+  ls -l /opt/darkmoon/python/bin | egrep -i 'nxc|netexec' || true
+
 # ----- Setup des outils Python (impacket, netexec, bloodhound) -----
 COPY setup_py.sh /setup_py.sh
-RUN chmod +x /setup_py.sh && /setup_py.sh || true
+RUN chmod +x /setup_py.sh && /setup_py.sh 
 
 # ----- Nuclei templates (runtime) -----
 COPY --from=builder /out/nuclei-templates /opt/darkmoon/nuclei-templates
@@ -283,6 +358,12 @@ RUN set -eux; \
   test -x /opt/darkmoon/ruby/bin/ruby; \
   chmod +x /opt/darkmoon/whatweb/whatweb
 
+# --- Nuclei : pré-initialiser les templates au chemin par défaut ---
+RUN set -eux; \
+  mkdir -p /root/nuclei-templates; \
+  cp -a /opt/darkmoon/nuclei-templates/. /root/nuclei-templates/ || true; \
+  # sanity non bloquant : permet à nuclei de voir les templates une première fois
+  nuclei -tl >/dev/null 2>&1 || true
 
 # Prompts
 COPY --from=builder /build/prompt /opt/darkmoon/prompt
