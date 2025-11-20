@@ -63,6 +63,7 @@ ENV PKG_CONFIG_PATH=${OUT}/curl/lib/pkgconfig
 # ---- Sources C++ ----
 COPY cpp/*.cpp ./cpp/
 
+
 # ---- Setup outils Go (tes installs) ----
 COPY setup.sh ./setup.sh
 RUN chmod +x ./setup.sh \
@@ -197,19 +198,6 @@ RUN set -eux; \
   ls -l "/out/bin"; \
   ls -l "/out/wordlists/dirb" | head -n 5
 
-# ---- Nmap minimal (libpcap incluse) -> /out/bin/nmap ----
-ARG NMAP_VER=7.95
-RUN set -eux; \
-  curl -fsSL https://nmap.org/dist/nmap-${NMAP_VER}.tar.bz2 -o nmap.tar.bz2; \
-  tar -xjf nmap.tar.bz2; cd nmap-${NMAP_VER}; \
-  ./configure --prefix=${OUT} \
-              --with-libpcap=included \
-              --without-zenmap \
-              --without-ndiff \
-              --disable-nls; \
-  make -j"$(nproc)"; make install; \
-  ${OUT}/bin/nmap -V
-
 # ---- kubectl CLI recompilé avec un Go récent -> /out/bin/kubectl ----
 ARG KUBECTL_VER=v1.34.2
 RUN set -eux; \
@@ -265,6 +253,7 @@ FROM debian:bookworm-slim AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Base minimale + kdig (alias dig) + libs runtime requises
+# Base minimale + outils requis AU RUNTIME
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates tzdata bash dnsutils \
@@ -274,11 +263,10 @@ RUN apt-get update \
       hydra \
       snmp \
       openssh-client \
+      curl jq \
  && rm -rf /var/lib/apt/lists/*
 
 # ----- COPIES DIRECTES depuis /out (builder) -----
-# ----- BINAIRES -----
-COPY --from=builder /out/bin/nmap         /usr/local/bin/nmap
 COPY --from=builder /out/bin/dirb         /usr/local/bin/dirb
 COPY --from=builder /out/bin/waybackurls  /usr/local/bin/waybackurls
 COPY --from=builder /out/bin/kubectl      /usr/local/bin/kubectl
@@ -286,6 +274,20 @@ COPY --from=builder /out/bin/kubectl      /usr/local/bin/kubectl
 COPY --from=builder /out/bin/agentfactory /opt/darkmoon/agentfactory
 COPY --from=builder /out/bin/mcp          /opt/darkmoon/mcp
 COPY --from=builder /out/bin/ZAP-CLI      /opt/darkmoon/ZAP-CLI
+
+# Wordlists dirb depuis le builder -> chemin standard runtime
+COPY --from=builder /out/wordlists/dirb /usr/share/wordlists/dirb
+
+# Symlink de compat : certaines cmds s'attendent à /usr/share/dirb/wordlists
+RUN set -eux; \
+  mkdir -p /usr/share/dirb; \
+  [ -d /usr/share/wordlists/dirb ] && ln -sfn /usr/share/wordlists/dirb /usr/share/dirb/wordlists; \
+  # sanity
+  test -f /usr/share/wordlists/dirb/common.txt
+
+RUN set -eux; \
+  which curl; curl --version >/dev/null; \
+  which jq;   jq --version   >/dev/null
 
 RUN ln -s /opt/darkmoon/agentfactory /usr/local/bin/agentfactory \
  && ln -s /opt/darkmoon/mcp          /usr/local/bin/mcp \
@@ -393,14 +395,13 @@ ENV GEM_HOME="/opt/darkmoon/ruby/lib/ruby/gems/3.3.0" \
 # ⚠️ Supprime toute ligne ENV RUBYLIB ici
 
 
-# Self-check (tolérant)
+# Self-check (tolérant) — SANS NMAP
 RUN set -eux; \
-  # 1) Présence des binaires principaux (chemins connus)
-  for b in /usr/local/bin/nmap /usr/local/bin/dirb /usr/local/bin/waybackurls /usr/local/bin/whatweb; do \
+  # 1) Présence des binaires principaux (chemins connus) — nmap supprimé
+  for b in /usr/local/bin/dirb /usr/local/bin/waybackurls /usr/local/bin/whatweb; do \
     [ -x "$b" ] || { echo "MISSING $b" >&2; exit 1; }; \
   done; \
-  # 2) Sanity rapides
-  nmap -V >/dev/null; \
+  # 2) Sanity rapides (nmap -V supprimé)
   dirb -h >/dev/null || true; \
   waybackurls -h >/dev/null; \
   # 3) WhatWeb : env propre
