@@ -24,24 +24,10 @@ Quand `zap` est **healthy**, tu peux lancer les scans.
 Commande type (réseau interne Compose : hôte `zap`, port `8888`, token lu dans le volume partagé `/zap/wrk`) :
 
 ```bash
-docker compose exec darkmoon bash -lc '
-  cd "$DM_HOME" \
-  && export TOKEN="$(cat /zap/wrk/ZAP-API-TOKEN)" \
-  && ./agentfactory \
-       --agentfactory \
-       --zapcli ./ZAP-CLI \
-       --mcp ./mcp \
-       --host zap \
-       --apikey "$TOKEN" \
-       --baseurl "https://asc-it.fr/" \
-       --outdir "zap_cli_out" \
-       --port 8888 \
-       --katana \
-       --katana-bin ./kube/katana \
-       -- \
-       -depth 2 \
-       -proxy http://zap:8888
-'
+docker compose exec darkmoon bash -lc './agentfactory \
+  --web \
+  --prompt-file /opt/darkmoon/prompt/dvga_extreme_autopwn.txt \
+  --baseurl "http://dvga:5013/"'
 ```
 
 Sorties attendues : un dossier de travail sous `"$DM_HOME/zap_cli_out/..."` contenant les artefacts (katana, ZAP, recon, rapports, etc.).
@@ -71,15 +57,10 @@ Puis tu pourras utiliser `--kubeconfig "/root/.kube/config"` dans la commande.
 ## Commande type (Option A, kubeconfig dans le volume)
 
 ```bash
-docker compose exec darkmoon bash -lc '
-  cd "$DM_HOME" \
-  && ./agentfactory \
-       --k8s \
-       --mcp ./mcp \
-       --kubeconfig "$DM_HOME/kubeconfig" \
-       --context "kind-hacklab" \
-       --outdir "./out" \
-       --baseurl "http://localhost:1230"
+docker compose exec darkmoon bash -lc './agentfactory \
+  --k8s \
+  --prompt-file /opt/darkmoon/prompt/dvga_extreme_autopwn.txt \
+  --baseurl "http://localhost:1230"'   
 '
 ```
 
