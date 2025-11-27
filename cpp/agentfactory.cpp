@@ -1696,6 +1696,8 @@ struct AgentOptions {
     // Scripts ZAP (Zest / JS / Groovy etc.) à charger/activer.
     // Cf. struct ZapScriptSpec + CLI --zap-script name:type:engine:path
     std::vector<ZapScriptSpec> zap_scripts;
+    // Fichier de prompt externe pour le moteur MCP AUTOPWN Web/API
+    fs::path mcp_autopwn_prompt_file;
 };
 
 // Trouver dernier fichier avec préfixe (non-recursif)
@@ -4426,10 +4428,7 @@ static bool run_api_web_autopwn_mcp(const AgentOptions &opt,
     if (recon_context.empty()) {
         recon_context = "[[AUCUN FICHIER DE RECON TROUVE DANS LE WORKDIR]]\n";
     }
-
-    // --------------------------------------------------------------------
-    // 2) PROMPTS MCP
-    // --------------------------------------------------------------------
+    
     // --------------------------------------------------------------------
     // 2) PROMPTS MCP
     // --------------------------------------------------------------------
@@ -4442,67 +4441,52 @@ static bool run_api_web_autopwn_mcp(const AgentOptions &opt,
         "Tu restes strictement sur le host/port de la cible.\n"
         "Quand tu as totalement compromis la cible : echo \"DVGA_AUTOPWN_DONE\".\n";
 
-    // base_prompt = contexte complet + recon + historique
+    // 2.a) Charger le corps de prompt externe (bespoke)
+    std::string bespoke_body;
+    if (!opt.mcp_autopwn_prompt_file.empty()) {
+        try {
+            bespoke_body = readFile(opt.mcp_autopwn_prompt_file.string());
+        } catch (const std::exception &ex) {
+            logerr(std::string("run_api_web_autopwn_mcp: echec lecture prompt MCP externe '")
+                   + opt.mcp_autopwn_prompt_file.string() + "': " + ex.what());
+            bespoke_body.clear();
+        } catch (...) {
+            logerr(std::string("run_api_web_autopwn_mcp: echec lecture prompt MCP externe '")
+                   + opt.mcp_autopwn_prompt_file.string() + "'");
+            bespoke_body.clear();
+        }
+    }
+
+    if (bespoke_body.empty()) {
+        logerr("run_api_web_autopwn_mcp: aucun prompt MCP externe fourni (--prompt-file) ou fichier vide/illisible");
+        return false;
+    }
+
+    // 2.b) Construire base_prompt = header fixe + prompt bespoke + <recon> + <full_history>
     std::string base_prompt;
-    base_prompt =
-        "CIBLE WEB/API PRINCIPALE : " + opt.baseurl + "\n"
-        "Tu dois rester strictement sur CE host/port. Jamais localhost. Jamais un autre domaine.\n"
-        "\n"
-        "TON RÔLE :\n"
-        "Tu es un agent offensif autonome chargé d’exploiter une application WEB/API.\n"
-        "Tu dois enchaîner les actions offensives en fonction :\n"
-        "- du contexte de reconnaissance fourni (<recon>),\n"
-        "- des résultats ZAP/Nuclei/Katana/FFUF/Arjun/MCP,\n"
-        "- de l’historique exact des commandes.\n"
-        "\n"
-        "SURFACE D’ATTAQUE À COUVRIR (non exhaustif, mais prioritaire) :\n"
-        "1) GRAPHQL\n"
-        "   - Détection d’endpoint : /graphql, /api/graphql, /v1/graphql, etc.\n"
-        "   - Introspection, enumeration, abuse de droits, injections.\n"
-        "   - Lectures d’objets sensibles (users, pastes, audits).\n"
-        "   - Fonctions système (systemDebug, systemHealth, diagnostics).\n"
-        "   - Mutations et modifications de données si présentes.\n"
-        "\n"
-        "2) API REST / JSON\n"
-        "   - Déduction depuis FFUF, Katana, Wayback, Arjun, Nuclei, MCP.\n"
-        "   - Paramètres sensibles, bruteforce de chemins, fuzzing des verbs HTTP.\n"
-        "   - Détection SQLi : classique, boolean-based, time-based.\n"
-        "   - Détection XSS (reflected/stored), injection JSON, erreurs backend.\n"
-        "   - Détection SSRF, LFI, RFI, Path Traversal, uploads dangereux.\n"
-        "\n"
-        "3) AUTHENTICATION / SESSION\n"
-        "   - Bruteforce contrôlé (max 3 tentatives par motif).\n"
-        "   - Test de contournement d’auth, tokens faibles, JWT, cookies.\n"
-        "   - Test des endpoints admin/api/v1/admin/v1/users/…\n"
-        "\n"
-        "4) ABUS DE LOGIQUE\n"
-        "   - IDOR (modification d’ID numériques).\n"
-        "   - Mass assignment, bypass de permissions.\n"
-        "   - Endpoints “debug”, “health”, “diagnostics”, “status”.\n"
-        "\n"
-        "RÈGLES CRITIQUES :\n"
-        "- Toujours une seule commande POSIX par réponse.\n"
-        "- Jamais un mot, jamais une explication, jamais un commentaire.\n"
-        "- Ne jamais réessayer une stratégie qui a déjà échoué 3 fois dans l’historique.\n"
-        "- Reconnaître automatiquement un succès :\n"
-        "    * Exfiltration de données sensibles (users, tokens, secrets…)\n"
-        "    * Fonctions système accessibles (debug/health/update/diagnostics)\n"
-        "    * Dump d’objets internes\n"
-        "    * Flag, secret, mot de passe admin trouvé\n"
-        "    * RCE, lecture de /proc, ps, env, ou sortie système\n"
-        "- Dès qu’un succès notable apparaît → renvoyer :\n"
-        "    echo \"DVGA_AUTOPWN_DONE\"\n"
-        "\n"
-        "RECON CENTRALISÉ (fourni par l’orchestrateur) :\n"
-        "<recon>\n" + recon_context + "\n</recon>\n"
-        "\n"
-        "HISTORIQUE STRICT DES COMMANDES ET RÉSULTATS :\n"
-        "Tu dois t’en servir pour changer de stratégie immédiatement si :\n"
-        "- un endpoint échoue plusieurs fois,\n"
-        "- un pattern de brute-force est détecté,\n"
-        "- une donnée interne ou un flag apparaît.\n"
-        "\n"
-        "<full_history>\n";
+    base_prompt.reserve(4096);
+
+    // Header minimal (tu peux l’adapter si tu veux enlever la mention DVGA)
+    base_prompt += "🛰  MODE DVGA_EXTREME_AUTOPWN_CHALLENGES\n";
+    base_prompt += "CIBLE WEB/API PRINCIPALE : " + opt.baseurl + "\n";
+    base_prompt += "Tu dois rester STRICTEMENT et EXCLUSIVEMENT sur CE host/port.\n";
+    base_prompt += "INTERDIT : localhost, 127.0.0.1, autres domaines, autres ports.\n";
+    base_prompt += "\n";
+
+    // Corps externe
+    base_prompt += bespoke_body;
+    base_prompt += "\n\n";
+
+    // Contexte de recon
+    base_prompt += "RECON CENTRALISÉ :\n";
+    base_prompt += "<recon>\n";
+    base_prompt += recon_context;
+    base_prompt += "\n</recon>\n\n";
+
+    // Historique incrémental
+    base_prompt += "HISTORIQUE COMPLET :\n";
+    base_prompt += "<full_history>\n";
+
 
     auto sanitize = [&](const std::string &raw) {
         std::string out;
@@ -4609,7 +4593,7 @@ static bool run_api_web_autopwn_mcp(const AgentOptions &opt,
         last_cmd1 = next_cmd;
     }
 
-    logerr("run_api_web_autopwn_mcp: MAX_STEPS atteint sans succès");
+    loginfo("run_api_web_autopwn_mcp: MAX_STEPS atteint sans succès");
     return false;
 }
 
@@ -11662,7 +11646,7 @@ static bool run_agentfactory(const AgentOptions &opt){
                 ansi::reset);
         bool ok_autopwn = run_api_web_autopwn_mcp(opt, workdir);
         if (!ok_autopwn) {
-            logerr("[MCP] run_api_web_autopwn_mcp failed (continuing with report generation).");
+            loginfo("[MCP] run_api_web_autopwn_mcp finished (continuing with report generation).");
         }
     }
    
@@ -11798,6 +11782,7 @@ struct CLIOptions {
     bool intrusive = false; // active les flows intrusifs (brute/dump/exfil)
     std::string lab_sender_domain; 
     std::string mcp;
+    std::string mcp_autopwn_prompt_file;
     std::string zapcli;
     std::string host="localhost";
     uint16_t port=8888;
@@ -11847,9 +11832,15 @@ static CLIOptions parse_cli(int argc, char** argv){
     for(int i = 1; i < argc; ++i){
         std::string a(argv[i]);
 
-        if(a == "--agentfactory") c.agentfactory = true;
+        if      (a == "--agentfactory" || a == "--web") {
+        // --web = alias lisible pour le mode "orchestrateur web"
+            c.agentfactory = true;
+        }
         else if(a == "--k8s") c.k8s = true;
         else if(a == "--mcp" && i+1 < argc) c.mcp = argv[++i];
+        else if (a == "--prompt-file" && i + 1 < argc) {
+            c.mcp_autopwn_prompt_file = argv[++i];
+        }
         else if(a == "--zapcli" && i+1 < argc) c.zapcli = argv[++i];
         else if(a == "--host" && i+1 < argc) c.host = argv[++i];
         else if(a == "--port" && i+1 < argc) c.port = (uint16_t)std::stoi(argv[++i]);
@@ -12048,6 +12039,26 @@ static fs::path find_latest_workdir_for_target(const fs::path &outdir,
     return best;
 }
 
+static std::string read_zap_token_file_default()
+{
+    const char *path = "/zap/wrk/ZAP-API-TOKEN";
+    std::ifstream in(path);
+    if (!in) {
+        return {};
+    }
+
+    std::string tok;
+    std::getline(in, tok);
+
+    // trim fin de ligne / espaces
+    while (!tok.empty() &&
+           (tok.back() == '\r' || tok.back() == '\n' ||
+            tok.back() == ' '  || tok.back() == '\t')) {
+        tok.pop_back();
+    }
+    return tok;
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
     // UTF-8 console + ANSI VT si possible
@@ -12055,8 +12066,73 @@ int main(int argc, char** argv) {
     SetConsoleCP(CP_UTF8);
     enable_ansi_colors();
 #endif
+    // Se placer automatiquement dans $DM_HOME si défini
+    if (const char* dm_home = std::getenv("DM_HOME")) {
+        if (*dm_home) {
+            try {
+                fs::current_path(dm_home);
+            } catch (const std::exception &e) {
+                logerr(std::string("WARN: impossible de chdir vers DM_HOME=")
+                       + dm_home + " : " + e.what());
+            } catch (...) {
+                logerr("WARN: impossible de chdir vers DM_HOME (exception inconnue)");
+            }
+        }
+    }
 
     CLIOptions cli = parse_cli(argc, argv);
+
+    // -----------------------------------------------------------------
+    // Overrides ZAP : host / port / apikey depuis l'environnement
+    // -----------------------------------------------------------------
+
+    // 1) HOST / PORT : éviter localhost:8888 dans le conteneur "darkmoon"
+    const char *env_zap_host = std::getenv("DM_ZAP_HOST");
+    if (cli.host == "localhost") {
+        if (env_zap_host && *env_zap_host) {
+            // si l'utilisateur fournit DM_ZAP_HOST, on le respecte
+            cli.host = env_zap_host;
+        } else {
+            // heuristique : si /zap/wrk existe, on est presque sûrement dans la stack
+            std::error_code ec;
+            if (std::filesystem::exists("/zap/wrk", ec)) {
+                cli.host = "zap";  // nom du service docker-compose
+            }
+        }
+    }
+
+    const char *env_zap_port = std::getenv("DM_ZAP_PORT");
+    if (env_zap_port && *env_zap_port) {
+        try {
+            cli.port = static_cast<uint16_t>(std::stoi(env_zap_port));
+        } catch (...) {
+            // on garde la valeur par défaut (8888) si parsing foire
+        }
+    }
+
+    // 2) API KEY : DM_ZAP_APIKEY > ZAP_API_TOKEN > fichier /zap/wrk/ZAP-API-TOKEN
+    if (cli.apikey.empty()) {
+        if (const char *env_api = std::getenv("DM_ZAP_APIKEY")) {
+            if (*env_api) {
+                cli.apikey = env_api;
+            }
+        }
+
+        if (cli.apikey.empty()) {
+            if (const char *env_api2 = std::getenv("ZAP_API_TOKEN")) {
+                if (*env_api2) {
+                    cli.apikey = env_api2;
+                }
+            }
+        }
+
+        if (cli.apikey.empty()) {
+            std::string tok = read_zap_token_file_default();
+            if (!tok.empty()) {
+                cli.apikey = tok;
+            }
+        }
+    }
 
     // Initialisation de la config globale de scan à partir des options CLI
     g_intrusive_mode = cli.intrusive;
@@ -12092,6 +12168,7 @@ int main(int argc, char** argv) {
         opt.outdir    = cli.outdir;
         opt.mcp_path  = cli.mcp;
         opt.wait_browse = false;
+        opt.mcp_autopwn_prompt_file = cli.mcp_autopwn_prompt_file;
 
         // chemins K8s
         fs::path K(cli.kube_dir);
@@ -12112,7 +12189,57 @@ int main(int argc, char** argv) {
         return ok ? 0 : 2;
     }
     // ===================== MODE WEB / AGENTFACTORY =====================
-    else if (cli.agentfactory) {
+    else if (cli.agentfactory)
+    {
+        // -------------------------------------------------------------
+        // Mode "web" / agentfactory : valeurs par défaut intelligentes
+        // -------------------------------------------------------------
+        fs::path exe_dir = get_exe_parent_dir();
+
+        // 1) MCP : par défaut ./mcp à côté du binaire
+        if (cli.mcp.empty()) {
+            cli.mcp = (exe_dir / "mcp").string();
+        }
+
+        // 2) ZAP-CLI : par défaut ./ZAP-CLI à côté du binaire
+        if (cli.zapcli.empty()) {
+            cli.zapcli = (exe_dir / "ZAP-CLI").string();
+        }
+
+        // 3) Katana : activé par défaut, binaire kube/katana à côté du binaire
+        if (!cli.use_katana) {
+            cli.use_katana = true;
+        }
+        if (cli.katana_bin.empty()) {
+            cli.katana_bin = (exe_dir / "kube" / "katana").string();
+        }
+
+        // 4) Katana args par défaut : depth=2 + proxy ZAP si dispo
+        if (cli.katana_args.empty()) {
+            // profondeur
+            cli.katana_args.push_back("-depth");
+            cli.katana_args.push_back("2");
+
+            // proxy via ZAP si DM_ZAP_HOST/DM_ZAP_PORT définis
+            const char* env_host = std::getenv("DM_ZAP_HOST");
+            const char* env_port = std::getenv("DM_ZAP_PORT");
+            std::string proxy;
+
+            if (env_host && *env_host) {
+                proxy = "http://";
+                proxy += env_host;
+                if (env_port && *env_port) {
+                    proxy += ":";
+                    proxy += env_port;
+                }
+            }
+
+            if (!proxy.empty()) {
+                cli.katana_args.push_back("-proxy");
+                cli.katana_args.push_back(proxy);
+            }
+        }
+
         // Wiring Katana global (une fois pour toutes)
         g_use_katana          = cli.use_katana;
         g_katana_bin_explicit = cli.katana_bin;
@@ -12139,6 +12266,7 @@ int main(int argc, char** argv) {
             opt.outdir      = cli.outdir;
             opt.mcp_path    = cli.mcp;
             opt.wait_browse = cli.wait_browse;
+            opt.mcp_autopwn_prompt_file = cli.mcp_autopwn_prompt_file;
 
             if (!cli.zapcli.empty()) {
                 opt.zapcli_path = cli.zapcli;
