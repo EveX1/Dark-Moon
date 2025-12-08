@@ -11,7 +11,7 @@ services:
     environment:
       ZAP_PORT: "8888"
       # Optionnel : liste des add-ons à installer automatiquement (séparés par espaces)
-      ZAP_ADDONS: "openapi graphql soap ajaxSpider pscanrulesAlpha pscanrulesBeta ascanrulesAlpha ascanrulesBeta fuzz importurls retire"
+      ZAP_ADDONS: "openapi graphql soap ajaxSpider pscanrulesAlpha pscanrulesBeta ascanrulesAlpha ascanrulesBeta fuzz importurls retire communityScripts wappalyzer"
       # Optionnel : tu peux aussi injecter toi-même la clé ici
       # ZAP_API_TOKEN: "ta-cle-ultra-secrete"
     volumes:

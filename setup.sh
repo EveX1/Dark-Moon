@@ -356,6 +356,10 @@ else
   warn "zgrab2 KO (binaire introuvable)"
 fi
 
+# 10) ffuf — fuzzer / directory & parameter discovery
+msg "ffuf …"
+go_build_with_pins "https://github.com/ffuf/ffuf" "." "ffuf" || warn "ffuf KO"
+
 # Récapitulatif
 msg "Binaires installés dans $KUBE_DIR :"
 ls -lh "$KUBE_DIR" || true

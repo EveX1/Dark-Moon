@@ -103,6 +103,13 @@ exec /opt/darkmoon/python/bin/sqlmap "$@"
 EOF
 chmod +x /usr/local/bin/sqlmap
 
+# arjun (HTTP parameter discovery, venv Darkmoon)
+cat >/usr/local/bin/arjun <<'EOF'
+#!/bin/sh
+exec /opt/darkmoon/python/bin/arjun "$@"
+EOF
+chmod +x /usr/local/bin/arjun
+
 # awscli (venv Darkmoon)
 cat >/usr/local/bin/aws <<'EOF'
 #!/bin/sh
@@ -119,6 +126,9 @@ msg "Installation wafw00f …"
 
 msg "Installation sqlmap …"
 "$PIP_BIN" install --no-cache-dir sqlmap && ok "sqlmap"
+
+msg "Installation arjun …"
+"$PIP_BIN" install --no-cache-dir arjun && ok "arjun"
 
 msg "Installation awscli …"
 "$PIP_BIN" install --no-cache-dir awscli && ok "awscli"
