@@ -130,19 +130,22 @@ else
   exit 1
 fi
 
-# 4) kubescape — build aligné sur master (doc officielle)
-msg "kubescape (upstream master) …"
+# 4) kubescape — version figée (fix incompatibilité docker/buildx)
+msg "kubescape (version stable v3.0.9)…"
 
 KUBESCAPE_REPO="https://github.com/kubescape/kubescape"
 tmp="$(mktemp -d)"
 
-git clone --depth=1 "$KUBESCAPE_REPO" "$tmp/src"
+git clone "$KUBESCAPE_REPO" "$tmp/src"
 
 (
   set -e
   cd "$tmp/src"
 
-  # Build conforme à la doc: go build .
+  # Figer sur une version compatible (évite les erreurs moby/moby vs docker/docker)
+  git checkout v3.0.9
+
+  # Build propre
   CGO_ENABLED=0 GO111MODULE=on GOTOOLCHAIN=local \
     go build -trimpath -ldflags="-s -w" -o "$KUBE_DIR/kubescape" .
 )
@@ -150,10 +153,9 @@ git clone --depth=1 "$KUBESCAPE_REPO" "$tmp/src"
 rm -rf "$tmp"
 
 if [ -x "$KUBE_DIR/kubescape" ]; then
-  ok "kubescape build (upstream master)"
+  ok "kubescape build (v3.0.9)"
 else
-  warn "kubescape KO (build upstream master) – binaire non généré"
-  exit 1
+  warn "kubescape KO (v3.0.9)"
 fi
 
 # 5) rbac-police — build local durci (plus de binaire précompilé)

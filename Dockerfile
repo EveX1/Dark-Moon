@@ -341,6 +341,9 @@ COPY --from=builder /out/bin/kubescape       /opt/darkmoon/kube/kubescape
 COPY --from=builder /out/bin/kubectl-who-can /opt/darkmoon/kube/kubectl-who-can
 COPY --from=builder /out/bin/kubeletctl      /opt/darkmoon/kube/kubeletctl
 COPY --from=builder /out/bin/rbac-police     /opt/darkmoon/kube/rbac-police
+COPY --from=builder /out/bin/ffuf            /opt/darkmoon/kube/ffuf
+
+
 
 # (Optionnel mais pratique) symlinks vers /usr/local/bin pour pouvoir les lancer partout
 RUN ln -s /opt/darkmoon/kube/naabu           /usr/local/bin/naabu           \
@@ -351,7 +354,8 @@ RUN ln -s /opt/darkmoon/kube/naabu           /usr/local/bin/naabu           \
  && ln -s /opt/darkmoon/kube/kubescape       /usr/local/bin/kubescape       \
  && ln -s /opt/darkmoon/kube/kubectl-who-can /usr/local/bin/kubectl-who-can \
  && ln -s /opt/darkmoon/kube/kubeletctl      /usr/local/bin/kubeletctl      \
- && ln -s /opt/darkmoon/kube/rbac-police     /usr/local/bin/rbac-police
+ && ln -s /opt/darkmoon/kube/rbac-police     /usr/local/bin/rbac-police     \
+ && ln -s /opt/darkmoon/kube/ffuf /usr/local/bin/ffuf
 
 # Sanity (évite de re-découvrir à l’exec)
 RUN set -eux; \
@@ -435,6 +439,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends apt-utils || tr
 RUN mkdir -p /var/lib/dpkg \
  && printf '' > /var/lib/dpkg/status \
  && rm -rf /var/lib/dpkg/updates /var/lib/dpkg/triggers /var/lib/dpkg/info || true
+
+# ----- Script directory with default executable permissions -----
+RUN mkdir -p /opt/darkmoon/scripts \
+    && apt-get update && apt-get install -y --no-install-recommends acl \
+    && setfacl -d -m u::rwx /opt/darkmoon/scripts \
+    && setfacl -d -m g::rwx /opt/darkmoon/scripts \
+    && setfacl -d -m o::rx  /opt/darkmoon/scripts
 
 # Entrypoint
 COPY entrypoint.sh /entrypoint.sh
