@@ -190,3 +190,99 @@ Ces scripts sont installés comme commandes dans `/opt/darkmoon/python/bin/` (do
 # Scripts:
 
 deux scripts disponible dans `/scripts/` sont disponible orchestrant les tools préinstallés, ces derniers snt accompagnés d'une documentation pur chacuns d'entres eux
+
+
+# TODO: Laboratoire à pentester pour entrainer DarkMoon
+
+---
+
+## 🌐 1. WEB / API / GRAPHQL / FRONTEND
+
+| Infrastructure | Protocoles     | Services / Tech        | Engine Darkmoon        | Labs équivalents                       |
+| -------------- | -------------- | ---------------------- | ---------------------- | -------------------------------------- |
+| Web classique  | HTTP / HTTPS   | Apache, Nginx, IIS     | engine_infra_web       | **OWASP Juice Shop**                   |
+| API REST       | HTTP / JSON    | Express, Spring, Flask | engine_web_api         | **OWASP crAPI**, **VAPI**              |
+| GraphQL        | HTTP / GraphQL | Apollo, Graphene       | engine_web_graphql     | **DVGA**, **GraphQL-Goat**             |
+| Auth Web       | HTTP / JWT     | OAuth2, SSO            | engine_web_auth        | **AuthLab**, **JWT-Goat**              |
+| CMS            | HTTP           | WordPress, Joomla      | engine_web_cms         | **WPScan VulnLab**, **HackTheBox CMS** |
+| Frontend JS    | HTTP           | React, Angular         | engine_web_frontend_js | **DOM XSS Labs**, **PortSwigger**      |
+| File Upload    | HTTP multipart | PHP, Node              | engine_web_upload      | **Upload Vulnerable Labs**             |
+| WAF / Proxy    | HTTP           | Cloudflare, Akamai     | engine_web_waf_bypass  | **WAF Evasion Labs**                   |
+| CI/CD Web      | HTTP / Git     | GitLab CI              | engine_web_ci_cd       | **GitHub Actions Labs**                |
+
+---
+
+## 🧠 2. ACTIVE DIRECTORY / WINDOWS
+
+| Infrastructure | Protocoles   | Services    | Engine Darkmoon    | Labs équivalents                      |
+| -------------- | ------------ | ----------- | ------------------ | ------------------------------------- |
+| Domaine AD     | Kerberos     | KDC         | engine_ad_kerberos | **AttackDefense AD**, **HTB AD Labs** |
+| SMB            | SMBv1/v2     | File Shares | engine_ad_smb      | **VulnAD**, **GOAD**                  |
+| LDAP           | LDAP / LDAPS | Directory   | engine_ad_ldap     | **LDAP Injection Labs**               |
+| DNS AD         | DNS          | SRV records | engine_ad_dns_srv  | **AD DNS Labs**                       |
+| ADCS           | RPC / HTTP   | PKI         | engine_ad_adcs     | **ADCS Abuse Labs**                   |
+| GPO            | SMB          | SYSVOL      | engine_ad_gpo      | **BloodHound Labs**                   |
+| Lateral Move   | RPC          | WinRM / WMI | engine_ad_privesc  | **Proving Grounds AD**                |
+
+---
+
+## 📡 3. NETWORK / INFRASTRUCTURE
+
+| Infrastructure | Protocoles    | Services    | Engine Darkmoon            | Labs équivalents                 |
+| -------------- | ------------- | ----------- | -------------------------- | -------------------------------- |
+| DNS            | UDP/TCP 53    | Bind        | engine_proto_dns           | **DNSGoat**, **PortSwigger DNS** |
+| FTP            | TCP 21        | vsftpd      | engine_proto_ftp           | **VulnFTP**, **HTB FTP**         |
+| SSH            | TCP 22        | OpenSSH     | engine_proto_ssh_telnet    | **SSH Weak Labs**                |
+| SNMP           | UDP 161       | SNMPv2      | engine_proto_snmp          | **SNMP Labs**                    |
+| Mail           | SMTP/IMAP     | Postfix     | engine_proto_mail_services | **MailGoat**                     |
+| VPN            | IPsec/OpenVPN | VPN Gateway | engine_proto_vpn_access    | **VPN Labs**                     |
+| Wi-Fi          | 802.11        | WPA2        | engine_proto_wifi          | **WiFi Pineapple Labs**          |
+| RDP/VNC        | TCP 3389      | RDP         | engine_proto_rdp_vnc       | **BlueKeep Labs**                |
+| ICMP           | ICMP          | Tunnel      | engine_proto_icmp_tunnel   | **ICMP Tunnel Labs**             |
+| BGP/OSPF       | TCP/UDP       | Routing     | engine_proto_bgp_ospf      | **Routing Attack Labs**          |
+
+---
+
+## ☁️ 4. CLOUD (AWS / AZURE / GCP / OVH)
+
+| Infrastructure | Protocoles   | Services         | Engine Darkmoon                | Labs équivalents               |
+| -------------- | ------------ | ---------------- | ------------------------------ | ------------------------------ |
+| IAM            | HTTPS        | Roles / Policies | engine_cloud_iam               | **Flaws.cloud**, **CloudGoat** |
+| Compute        | HTTPS        | EC2 / VM         | engine_cloud_compute           | **AWSGoat**                    |
+| Storage        | HTTPS        | S3 / Blob        | engine_cloud_storage           | **S3Goat**                     |
+| Metadata       | HTTP 169.254 | IMDS             | engine_cloud_metadata_exposure | **IMDS Labs**                  |
+| Containers     | HTTPS        | EKS / GKE        | engine_cloud_containers        | **KubeGoat**                   |
+| CI/CD          | HTTPS        | Pipelines        | engine_cloud_ci_cd             | **CI/CD Goat**                 |
+| Serverless     | HTTPS        | Lambda           | engine_cloud_serverless        | **LambdaGoat**                 |
+| Secrets        | HTTPS        | Vault            | engine_cloud_secret_management | **Secrets Goat**               |
+| Billing Abuse  | HTTPS        | Billing API      | engine_cloud_billing_abuse     | **Cloud Abuse Labs**           |
+
+---
+
+## ⚙️ 5. IOT / EMBEDDED / SCADA / ICS
+
+| Infrastructure | Protocoles | Services   | Engine Darkmoon             | Labs équivalents           |
+| -------------- | ---------- | ---------- | --------------------------- | -------------------------- |
+| PLC            | Modbus/TCP | Automation | engine_proto_modbus         | **ModbusPal**, **ICSGoat** |
+| SCADA          | DNP3       | Energy     | engine_proto_dnp3           | **DNP3 Labs**              |
+| MQTT           | TCP 1883   | Broker     | engine_proto_mqtt           | **MQTTGoat**               |
+| CoAP           | UDP        | IoT        | engine_proto_coap           | **CoAP Labs**              |
+| ZigBee         | 802.15.4   | Mesh       | engine_proto_zigbee         | **ZigBee Labs**            |
+| BLE            | BLE        | GATT       | engine_proto_ble            | **BLEGoat**                |
+| Firmware       | Raw        | Binwalk    | engine_firmware_binwalk     | **OWASP IoT Goat**         |
+| Hardware       | UART/JTAG  | Debug      | engine_hw_jtag_uart         | **Hardware Hacking Labs**  |
+| ICS Auth       | Custom     | HMI        | engine_scada_authentication | **ICS Auth Labs**          |
+
+---
+
+## 🧬 6. ORCHESTRATION MULTI-INFRA (RARE & CRITIQUE)
+
+| Infrastructure mixte | Déclenchement  | Engine                           | Labs                  |
+| -------------------- | -------------- | -------------------------------- | --------------------- |
+| Web + AD             | LDAP leak      | engine_infra_global_orchestrator | **HTB Hybrid Labs**   |
+| Web + Cloud          | SSRF → IMDS    | engine_infra_global_orchestrator | **SSRF → AWS Labs**   |
+| VPN + AD             | Split tunnel   | engine_infra_network + AD        | **Corp Network Labs** |
+| IoT + Cloud          | MQTT bridge    | engine_infra_embedded + cloud    | **IoT Cloud Labs**    |
+| CI/CD + Cloud        | Pipeline abuse | engine_global                    | **Supply Chain Labs** |
+
+---
