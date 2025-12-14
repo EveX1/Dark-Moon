@@ -196,7 +196,7 @@ deux scripts disponible dans `/scripts/` sont disponible orchestrant les tools p
 
 ---
 
-## 🌐 1. WEB / API / GRAPHQL / FRONTEND
+## 1. WEB / API / GRAPHQL / FRONTEND
 
 | Infrastructure | Protocoles     | Services / Tech        | Engine Darkmoon        | Labs équivalents                       |
 | -------------- | -------------- | ---------------------- | ---------------------- | -------------------------------------- |
@@ -212,7 +212,7 @@ deux scripts disponible dans `/scripts/` sont disponible orchestrant les tools p
 
 ---
 
-## 🧠 2. ACTIVE DIRECTORY / WINDOWS
+## 2. ACTIVE DIRECTORY / WINDOWS
 
 | Infrastructure | Protocoles   | Services    | Engine Darkmoon    | Labs équivalents                      |
 | -------------- | ------------ | ----------- | ------------------ | ------------------------------------- |
@@ -226,7 +226,7 @@ deux scripts disponible dans `/scripts/` sont disponible orchestrant les tools p
 
 ---
 
-## 📡 3. NETWORK / INFRASTRUCTURE
+## 3. NETWORK / INFRASTRUCTURE
 
 | Infrastructure | Protocoles    | Services    | Engine Darkmoon            | Labs équivalents                 |
 | -------------- | ------------- | ----------- | -------------------------- | -------------------------------- |
@@ -243,7 +243,7 @@ deux scripts disponible dans `/scripts/` sont disponible orchestrant les tools p
 
 ---
 
-## ☁️ 4. CLOUD (AWS / AZURE / GCP / OVH)
+## 4. CLOUD (AWS / AZURE / GCP / OVH)
 
 | Infrastructure | Protocoles   | Services         | Engine Darkmoon                | Labs équivalents               |
 | -------------- | ------------ | ---------------- | ------------------------------ | ------------------------------ |
@@ -259,7 +259,7 @@ deux scripts disponible dans `/scripts/` sont disponible orchestrant les tools p
 
 ---
 
-## ⚙️ 5. IOT / EMBEDDED / SCADA / ICS
+## 5. IOT / EMBEDDED / SCADA / ICS
 
 | Infrastructure | Protocoles | Services   | Engine Darkmoon             | Labs équivalents           |
 | -------------- | ---------- | ---------- | --------------------------- | -------------------------- |
@@ -275,7 +275,7 @@ deux scripts disponible dans `/scripts/` sont disponible orchestrant les tools p
 
 ---
 
-## 🧬 6. ORCHESTRATION MULTI-INFRA (RARE & CRITIQUE)
+## 6. ORCHESTRATION MULTI-INFRA (RARE & CRITIQUE)
 
 | Infrastructure mixte | Déclenchement  | Engine                           | Labs                  |
 | -------------------- | -------------- | -------------------------------- | --------------------- |
