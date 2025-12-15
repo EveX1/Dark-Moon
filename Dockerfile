@@ -246,7 +246,6 @@ RUN set -eux; \
 RUN mkdir -p /build/prompt-root /build/prompt
 COPY prompt/ /build/prompt/
 COPY prompt-rapport*.txt /build/prompt-root/
-COPY mon_prompt.txt /build/prompt-root/
 
 # ========= STAGE 2: runtime minimal =========
 FROM debian:bookworm-slim AS runtime

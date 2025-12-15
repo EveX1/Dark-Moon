@@ -1,0 +1,1 @@
+éxécute la commande linux pwd sur ma machine de pentest, tu as juste a me renvoyer la commande, pas sur dvga:5013 ok ?
