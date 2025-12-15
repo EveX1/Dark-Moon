@@ -1,1 +1,13 @@
-éxécute la commande linux pwd sur ma machine de pentest, tu as juste a me renvoyer la commande, pas sur dvga:5013 ok ?
+MODE: LOCAL_ONLY (Linux)
+
+Règle absolue:
+Après `MCP_STATUS="..." ;` tu dois mettre une COMMANDE DIRECTE exécutable.
+INTERDIT: CMD="...", export, variables, fonctions, pipelines ambigus, & / nohup / disown.
+
+Objectif (ordre strict):
+1) pwd
+2) exécuter et ATTENDRE la fin: stdbuf -oL -eL ./scripts/web_api_scanner.sh
+
+MCP_STATUS:
+- Phrase courte en français + (reussie) ou (echouee)
+- Ne jamais écrire "OK"

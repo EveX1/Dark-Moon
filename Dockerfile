@@ -441,10 +441,7 @@ RUN mkdir -p /var/lib/dpkg \
 
 # ----- Script directory with default executable permissions -----
 RUN mkdir -p /opt/darkmoon/scripts \
-    && apt-get update && apt-get install -y --no-install-recommends acl \
-    && setfacl -d -m u::rwx /opt/darkmoon/scripts \
-    && setfacl -d -m g::rwx /opt/darkmoon/scripts \
-    && setfacl -d -m o::rx  /opt/darkmoon/scripts
+ && chmod 755 /opt/darkmoon/scripts
 
 # Entrypoint
 COPY entrypoint.sh /entrypoint.sh
