@@ -82,7 +82,7 @@ services:
     user: "0:0"
     volumes:
       - ./prompt:/opt/darkmoon/prompt
-      - ./script:/opt/darkmoon/script 
+      - ./scripts:/opt/darkmoon/scripts 
       - ${HOME}/darkmoon-docker-fs:/opt/darkmoon/zap_cli_out
       - ${HOME}/darkmoon-docker-fs:/opt/darkmoon/out
       - zap-data:/zap/wrk:ro
