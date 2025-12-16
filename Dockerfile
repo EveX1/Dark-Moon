@@ -152,6 +152,18 @@ RUN set -eux; \
   bundle config set --local without 'development test'; \
   bundle install --jobs "$(nproc)" --retry 3
 
+# ---- SecLists (FULL) -> /out/seclists ----
+ARG SECLISTS_REF=master
+
+RUN set -eux; \
+  git clone --depth=1 --branch "${SECLISTS_REF}" \
+    https://github.com/danielmiessler/SecLists.git \
+    "${OUT}/seclists"; \
+  rm -rf "${OUT}/seclists/.git"; \
+  # sanity légère (non bloquante)
+  test -d "${OUT}/seclists/Discovery" && \
+  ls -1 "${OUT}/seclists" | head -n 10
+
 # --- Harden Ruby gems: drop vulnerable versions still present ---
 RUN set -eux; \
   RUBY_PREFIX="/opt/darkmoon/ruby"; \
@@ -276,13 +288,27 @@ COPY --from=builder /out/bin/ZAP-CLI      /opt/darkmoon/ZAP-CLI
 
 # Wordlists dirb depuis le builder -> chemin standard runtime
 COPY --from=builder /out/wordlists/dirb /usr/share/wordlists/dirb
-
 # Symlink de compat : certaines cmds s'attendent à /usr/share/dirb/wordlists
 RUN set -eux; \
   mkdir -p /usr/share/dirb; \
   [ -d /usr/share/wordlists/dirb ] && ln -sfn /usr/share/wordlists/dirb /usr/share/dirb/wordlists; \
   # sanity
   test -f /usr/share/wordlists/dirb/common.txt
+
+# ---- SecLists (FULL runtime) ----
+COPY --from=builder /out/seclists /usr/share/seclists
+
+RUN set -eux; \
+  chmod -R a+rX /usr/share/seclists; \
+  # chemins standards attendus par les tools
+  mkdir -p /usr/share/wordlists; \
+  ln -sfn /usr/share/seclists /usr/share/wordlists/seclists; \
+  # cohérence Darkmoon
+  ln -sfn /usr/share/seclists /opt/darkmoon/seclists; \
+  # sanity non bloquant
+  test -f /usr/share/seclists/Discovery/Web-Content/common.txt || true
+
+ENV SECLISTS=/usr/share/seclists
 
 RUN set -eux; \
   which curl; curl --version >/dev/null; \
