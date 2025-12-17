@@ -271,10 +271,8 @@ RUN apt-get update \
       libssl3 zlib1g libnghttp2-14 libidn2-0 libpsl5 libkrb5-3 libssh2-1 \
       libstdc++6 libgcc-s1 libyaml-0-2 libreadline8 libffi8 libgmp10 libncursesw6 \
       libpcap0.8 \
-      hydra \
-      snmp \
-      openssh-client \
-      curl jq \
+      hydra snmp openssh-client curl jq \
+      inotify-tools \
  && rm -rf /var/lib/apt/lists/*
 
 # ----- COPIES DIRECTES depuis /out (builder) -----
@@ -466,8 +464,9 @@ RUN mkdir -p /var/lib/dpkg \
  && rm -rf /var/lib/dpkg/updates /var/lib/dpkg/triggers /var/lib/dpkg/info || true
 
 # ----- Script directory with default executable permissions -----
-RUN mkdir -p /opt/darkmoon/scripts \
- && chmod 755 /opt/darkmoon/scripts
+RUN mkdir -p /opt/darkmoon/bin
+COPY watch_scripts.sh /opt/darkmoon/bin/watch_scripts.sh
+RUN chmod +x /opt/darkmoon/bin/watch_scripts.sh
 
 # Entrypoint
 COPY entrypoint.sh /entrypoint.sh

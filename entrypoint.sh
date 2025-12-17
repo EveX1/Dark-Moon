@@ -43,4 +43,9 @@ fi
 # Ajoute au PATH pour cette session
 export PATH="$DM_HOME:$DM_HOME/kube:$PATH"
 
+# watcher scripts en background (trigger)
+if [ -d /opt/darkmoon/scripts ]; then
+  /opt/darkmoon/bin/watch_scripts.sh /opt/darkmoon/scripts >/dev/null 2>&1 &
+fi
+
 exec "$@"

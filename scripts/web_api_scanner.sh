@@ -5,7 +5,7 @@ set -euo pipefail
 # DARKMOON - WEB ONE-SHOT (ENDPOINT)
 # - ZAP seed + active scan + alerts
 # - Arjun (GET param discovery) avec auto-skip GraphQL
-# - SQLmap (safe guarded) avec timeout hard
+# - Seed POST JSON pour endpoints type login (ex: Juice Shop)
 #
 # NOTE: pas de brute-force login ici.
 #       -> Fournis un JWT via /tmp/darkmoon_jwt_token.txt ou env GLOBAL_JWT
@@ -23,8 +23,8 @@ Options:
   -z  ZAP proxy URL (default: http://zap:8888)
   -k  ZAP API key file (default: /zap/wrk/ZAP-API-TOKEN)
   -A  Arjun: true|false|auto (default: auto; auto désactive si GraphQL)
-  -S  SQLmap: true|false|auto (default: auto; auto désactive si GraphQL)
-  -t  SQLmap timeout seconds (default: 180)
+  -S  SQLmap: true|false|auto (default: auto; auto désactive si GraphQL)  [NOT USED here]
+  -t  SQLmap timeout seconds (default: 180)                              [NOT USED here]
   -h  Help
 USAGE
 }
@@ -43,6 +43,9 @@ TARGET_BASE=""
 # Fichiers temporaires partagés
 ARJUN_TMP="/tmp/darkmoon_arjun_tmp.json"
 JWT_FILE="/tmp/darkmoon_jwt_token.txt"
+
+# Probe tmp
+PROBE_BODY="/tmp/_dm_probe_body"
 
 ############## CLI PARSING ##############
 
@@ -65,6 +68,9 @@ if [ -z "${TARGET_BASE:-}" ]; then
   usage
   exit 1
 fi
+
+# Normalisation URL: supprime les doubles slash hors schéma (http://)
+TARGET_BASE="$(printf '%s' "$TARGET_BASE" | sed 's#://#§#; s#//#/#g; s#§#://#')"
 
 if [ ! -r "$APIKEY_FILE" ]; then
   echo "[!] Impossible de lire la clé API ZAP: $APIKEY_FILE"
@@ -92,15 +98,13 @@ jwt_decode_payload() {
 
 is_graphql_target() {
   local u="$1"
-  # heuristiques rapides
   [[ "$u" =~ /graphql(\?|$) ]] && return 0
   [[ "$u" =~ graphql ]] && return 0
 
-  # best effort: probe rapide
   local headers
-  headers="$(curl -sS -m 4 -D - -o /tmp/_dm_probe_body "$u" || true)"
+  headers="$(curl -sS -m 4 -D - -o "$PROBE_BODY" "$u" || true)"
   if grep -qi '^content-type:.*application/json' <<<"$headers"; then
-    if jq -e '.errors? // empty' </tmp/_dm_probe_body >/dev/null 2>&1; then
+    if jq -e '.errors? // empty' <"$PROBE_BODY" >/dev/null 2>&1; then
       return 0
     fi
   fi
@@ -108,13 +112,51 @@ is_graphql_target() {
 }
 
 should_enable_auto() {
-  # $1=mode(auto|true|false), $2=is_graphql(0/1)
   local mode="$1"
   local isg="$2"
   if [ "$mode" = "true" ]; then echo "true"; return; fi
   if [ "$mode" = "false" ]; then echo "false"; return; fi
-  # auto:
   if [ "$isg" = "1" ]; then echo "false"; else echo "true"; fi
+}
+
+is_likely_json_login() {
+  local u="$1"
+  [[ "$u" =~ /rest/user/login$ ]] && return 0
+  [[ "$u" =~ /login$ ]] && return 0
+  return 1
+}
+
+seed_get_via_zap_proxy() {
+  local url="$1"
+  if [ -n "${GLOBAL_JWT:-}" ]; then
+    curl -s -x "$ZAP" "$url" -H "Authorization: Bearer $GLOBAL_JWT" >/dev/null || true
+  else
+    curl -s -x "$ZAP" "$url" >/dev/null || true
+  fi
+}
+
+seed_post_json_via_zap_proxy() {
+  local url="$1"
+  local json_body="$2"
+  if [ -n "${GLOBAL_JWT:-}" ]; then
+    curl -s -x "$ZAP" "$url" \
+      -H "Authorization: Bearer $GLOBAL_JWT" \
+      -H "Content-Type: application/json" \
+      -d "$json_body" >/dev/null || true
+  else
+    curl -s -x "$ZAP" "$url" \
+      -H "Content-Type: application/json" \
+      -d "$json_body" >/dev/null || true
+  fi
+}
+
+zap_access_url() {
+  # Forcer l'URL dans le Sites Tree / Scan Tree de ZAP
+  local url="$1"
+  curl -sG "$ZAP/JSON/core/action/accessUrl/" \
+    --data-urlencode "apikey=$APIKEY" \
+    --data-urlencode "url=$url" \
+    --data-urlencode "followRedirects=true" >/dev/null || true
 }
 
 ############## [0] CONTEXTE / JWT ##############
@@ -150,7 +192,6 @@ for bin in "${REQUIRED[@]}"; do
   fi
 done
 
-# Arjun optionnel (puisqu’on peut le désactiver)
 if command -v arjun >/dev/null 2>&1; then
   echo "[OK] arjun trouvé : $(command -v arjun)"
 else
@@ -202,6 +243,8 @@ echo "==========================================="
 
 PARAMS=""
 
+: > "$ARJUN_TMP"
+
 if [ "$ARJUN_ON" = "true" ] && command -v arjun >/dev/null 2>&1; then
   set +e
   arjun -u "$TARGET_BASE" -m GET -oJ "$ARJUN_TMP"
@@ -218,7 +261,16 @@ if [ "$ARJUN_ON" = "true" ] && command -v arjun >/dev/null 2>&1; then
     cat "$ARJUN_TMP" || true
     echo
 
-    PARAMS="$(jq -r '.[].params[]? // empty' "$ARJUN_TMP" 2>/dev/null | sort -u || true)"
+    PARAMS_EXACT="$(jq -r --arg U "$TARGET_BASE" '
+      if has($U) then .[$U].params[]? else empty end
+    ' "$ARJUN_TMP" 2>/dev/null | sort -u || true)"
+
+    if [ -n "$PARAMS_EXACT" ]; then
+      PARAMS="$PARAMS_EXACT"
+    else
+      PARAMS="$(jq -r '.[].params[]? // empty' "$ARJUN_TMP" 2>/dev/null | sort -u || true)"
+    fi
+
     if [ -n "$PARAMS" ]; then
       echo "[OK] Paramètres trouvés : $PARAMS"
     else
@@ -229,7 +281,6 @@ if [ "$ARJUN_ON" = "true" ] && command -v arjun >/dev/null 2>&1; then
   fi
 else
   echo "[i] Skip Arjun (ARJUN_ENABLED=$ARJUN_ENABLED, GraphQL=$IS_GRAPHQL, ou arjun absent)."
-  : > "$ARJUN_TMP"
 fi
 echo
 
@@ -241,26 +292,27 @@ echo "==========================================="
 
 FIRST_ENRICHED=""
 
-if [ -n "${PARAMS:-}" ]; then
-  for P in $PARAMS; do
-    ENRICHED="${TARGET_BASE}?${P}=darkmoon_test"
-    echo "   -> Seed via proxy ZAP : $ENRICHED"
-    if [ -n "${GLOBAL_JWT:-}" ]; then
-      curl -s -x "$ZAP" "$ENRICHED" -H "Authorization: Bearer $GLOBAL_JWT" >/dev/null || true
-    else
-      curl -s -x "$ZAP" "$ENRICHED" >/dev/null || true
-    fi
-    if [ -z "$FIRST_ENRICHED" ]; then
-      FIRST_ENRICHED="$ENRICHED"
-    fi
-  done
-else
+# Cas spécial: endpoint login / JSON POST => seed un POST JSON
+if [ "$IS_GRAPHQL" -eq 0 ] && is_likely_json_login "$TARGET_BASE"; then
+  echo "   -> Seed POST JSON via proxy ZAP : $TARGET_BASE"
+  seed_post_json_via_zap_proxy "$TARGET_BASE" '{"email":"test@test.com","password":"test"}'
   FIRST_ENRICHED="$TARGET_BASE"
-  echo "   -> Seed via proxy ZAP : $FIRST_ENRICHED"
-  if [ -n "${GLOBAL_JWT:-}" ]; then
-    curl -s -x "$ZAP" "$FIRST_ENRICHED" -H "Authorization: Bearer $GLOBAL_JWT" >/dev/null || true
+fi
+
+if [ -z "$FIRST_ENRICHED" ]; then
+  if [ -n "${PARAMS:-}" ]; then
+    for P in $PARAMS; do
+      ENRICHED="${TARGET_BASE}?${P}=darkmoon_test"
+      echo "   -> Seed via proxy ZAP : $ENRICHED"
+      seed_get_via_zap_proxy "$ENRICHED"
+      if [ -z "$FIRST_ENRICHED" ]; then
+        FIRST_ENRICHED="$ENRICHED"
+      fi
+    done
   else
-    curl -s -x "$ZAP" "$FIRST_ENRICHED" >/dev/null || true
+    FIRST_ENRICHED="$TARGET_BASE"
+    echo "   -> Seed via proxy ZAP : $FIRST_ENRICHED"
+    seed_get_via_zap_proxy "$FIRST_ENRICHED"
   fi
 fi
 
@@ -273,36 +325,123 @@ echo
 echo "[i] URL choisie pour l'Active Scan ZAP : $FIRST_ENRICHED"
 echo
 
-############## [5] ZAP SCAN ##############
-
 echo "==========================================="
-echo "[5] Activation des scanners ZAP"
-echo "==========================================="
-curl -s "$ZAP/JSON/ascan/action/enableAllScanners/?apikey=$APIKEY" >/dev/null || true
-curl -s "$ZAP/JSON/pscan/action/setEnabled/?apikey=$APIKEY&enabled=true" >/dev/null || true
-echo "[OK] Active + Passive scanners activés."
-echo
-
-echo "==========================================="
-echo "[6] Lancement Active Scan ZAP sur :"
-echo "    $FIRST_ENRICHED"
+echo "[5] ZAP – Scan AGRESSIF (blackbox, URL only)"
 echo "==========================================="
 
-ESCAPED_URL="$(printf '%s' "$FIRST_ENRICHED" | sed 's/&/%26/g')"
+# 1️⃣ Activer TOUS les scanners (stable + alpha + beta)
+curl -sG "$ZAP/JSON/ascan/action/enableAllScanners/" \
+  --data-urlencode "apikey=$APIKEY" >/dev/null || true
 
-SCAN_ID="$(
-  curl -s "$ZAP/JSON/ascan/action/scan/?apikey=$APIKEY&url=$ESCAPED_URL&recurse=false&inScopeOnly=false" \
-  | jq -r '.scan // empty'
+# 2️⃣ Attack strength = HIGH, Alert threshold = LOW
+for id in $(curl -sG "$ZAP/JSON/ascan/view/scanners/" \
+  --data-urlencode "apikey=$APIKEY" | jq -r '.scanners[].id'); do
+  curl -sG "$ZAP/JSON/ascan/action/setScannerAttackStrength/" \
+    --data-urlencode "apikey=$APIKEY" \
+    --data-urlencode "id=$id" \
+    --data-urlencode "attackStrength=HIGH" >/dev/null || true
+
+  curl -sG "$ZAP/JSON/ascan/action/setScannerAlertThreshold/" \
+    --data-urlencode "apikey=$APIKEY" \
+    --data-urlencode "id=$id" \
+    --data-urlencode "alertThreshold=LOW" >/dev/null || true
+done
+
+# 3️⃣ Activer les input vectors avancés
+curl -sG "$ZAP/JSON/ascan/action/setOptionAttackHeaders/" \
+  --data-urlencode "apikey=$APIKEY" \
+  --data-urlencode "Boolean=true" >/dev/null || true
+
+curl -sG "$ZAP/JSON/ascan/action/setOptionAttackJSONParameters/" \
+  --data-urlencode "apikey=$APIKEY" \
+  --data-urlencode "Boolean=true" >/dev/null || true
+
+curl -sG "$ZAP/JSON/ascan/action/setOptionAttackURLPath/" \
+  --data-urlencode "apikey=$APIKEY" \
+  --data-urlencode "Boolean=true" >/dev/null || true
+
+# 4️⃣ Passif activé (pour DOM XSS, headers, SPA leaks)
+curl -sG "$ZAP/JSON/pscan/action/setEnabled/" \
+  --data-urlencode "apikey=$APIKEY" \
+  --data-urlencode "enabled=true" >/dev/null || true
+
+# 5️⃣ Forcer l’URL dans le Sites Tree
+zap_access_url "$FIRST_ENRICHED"
+
+# 6️⃣ Lancer l’Active Scan STRICTEMENT sur l’URL
+RAW_SCAN_RESP="$(
+  curl -sG "$ZAP/JSON/ascan/action/scan/" \
+    --data-urlencode "apikey=$APIKEY" \
+    --data-urlencode "url=$FIRST_ENRICHED" \
+    --data-urlencode "recurse=false" \
+    --data-urlencode "inScopeOnly=false"
 )"
 
+SCAN_ID="$(echo "$RAW_SCAN_RESP" | jq -r '.scan // empty')"
+
 if [ -z "$SCAN_ID" ] || [ "$SCAN_ID" = "null" ]; then
+  echo "[!] Active scan non démarré"
+  echo "$RAW_SCAN_RESP"
+else
+  echo "[OK] Active Scan ID: $SCAN_ID"
+  while true; do
+    PCT="$(curl -sG "$ZAP/JSON/ascan/view/status/" \
+      --data-urlencode "apikey=$APIKEY" \
+      --data-urlencode "scanId=$SCAN_ID" | jq -r '.status')"
+    echo -ne "   ActiveScan: $PCT%   \r"
+    [ "$PCT" -ge 100 ] && break
+    sleep 1
+  done
+  echo
+fi
+echo
+
+
+BASE_NOQUERY="$(printf '%s' "$FIRST_ENRICHED" | sed 's/[?].*$//')"
+
+# IMPORTANT: ZAP refuse ascan si l'URL n'est pas dans le Scan Tree
+echo "[i] Forçage de l'URL dans le Sites Tree (ZAP core/accessUrl)"
+zap_access_url "$BASE_NOQUERY"
+zap_access_url "$FIRST_ENRICHED"
+
+RAW_SCAN_RESP="$(
+  curl -sG "$ZAP/JSON/ascan/action/scan/" \
+    --data-urlencode "apikey=$APIKEY" \
+    --data-urlencode "url=$BASE_NOQUERY" \
+    --data-urlencode "recurse=false" \
+    --data-urlencode "inScopeOnly=false"
+)"
+
+SCAN_ID="$(printf '%s' "$RAW_SCAN_RESP" | jq -r '.scan // empty' 2>/dev/null || true)"
+
+if [ -z "${SCAN_ID:-}" ] || [ "$SCAN_ID" = "null" ]; then
   echo "[!] Impossible de démarrer le scan actif (SCAN_ID vide ou null)."
+  echo "[i] Réponse brute ZAP /ascan/action/scan :"
+  echo "$RAW_SCAN_RESP"
+
+  echo
+  echo "[i] Sanity checks utiles :"
+  echo "   -> ZAP version:"
+  curl -sG "$ZAP/JSON/core/view/version/" --data-urlencode "apikey=$APIKEY" || true
+  echo
+  echo "   -> Access check cible:"
+  if is_likely_json_login "$BASE_NOQUERY"; then
+    curl -s -o /dev/null -w "HTTP=%{http_code}\n" \
+      -H "Content-Type: application/json" \
+      -d '{"email":"test@test.com","password":"test"}' \
+      "$BASE_NOQUERY" || true
+  else
+    curl -s -o /dev/null -w "HTTP=%{http_code}\n" "$BASE_NOQUERY" || true
+  fi
 else
   echo "[OK] Scan ID : $SCAN_ID"
   echo
   echo "[6-bis] Progression :"
   while true; do
-    RAW="$(curl -s "$ZAP/JSON/ascan/view/status/?apikey=$APIKEY&scanId=$SCAN_ID")"
+    RAW="$(curl -sG "$ZAP/JSON/ascan/view/status/" \
+      --data-urlencode "apikey=$APIKEY" \
+      --data-urlencode "scanId=$SCAN_ID"
+    )"
     PCT="$(echo "$RAW" | jq -r '.status // "0"')"
     if ! [[ "$PCT" =~ ^[0-9]+$ ]]; then
       PCT="0"
@@ -324,10 +463,17 @@ echo "==========================================="
 echo "[7] Alertes ZAP Medium/High (filtrées)"
 echo "==========================================="
 
-curl -s "$ZAP/JSON/core/view/alerts/?apikey=$APIKEY&start=0&count=9999" \
-  | jq -c --arg URL "$FIRST_ENRICHED" '
+# Filtre prefix sur l'URL de base
+BASE_ALERT="$(printf '%s' "$BASE_NOQUERY" | sed 's/[?].*$//')"
+
+curl -sG "$ZAP/JSON/core/view/alerts/" \
+  --data-urlencode "apikey=$APIKEY" \
+  --data-urlencode "start=0" \
+  --data-urlencode "count=9999" \
+  | jq -c --arg BASE "$BASE_ALERT" '
       .alerts[]
-      | select(.url == $URL and (.risk == "Medium" or .risk == "High"))
+      | select((.risk == "Medium" or .risk == "High"))
+      | select((.url | startswith($BASE)))
       | {risk, alert, url, param, evidence}
     ' || echo "[!] Impossible de parser les alertes ZAP."
 echo
