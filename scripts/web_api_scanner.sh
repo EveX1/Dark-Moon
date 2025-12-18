@@ -477,3 +477,23 @@ curl -sG "$ZAP/JSON/core/view/alerts/" \
       | {risk, alert, url, param, evidence}
     ' || echo "[!] Impossible de parser les alertes ZAP."
 echo
+
+############## [8] NUCLEI ##############
+echo "==========================================="
+echo "[8] Nuclei (URL)"
+echo "==========================================="
+
+if [ "$NUCLEI_ENABLED" = "true" ]; then
+  : > "$NUCLEI_OUT"
+  # Safe default: no aggressive fuzzing; still very useful for known misconfigs
+  nuclei -u "$BASE_NOQUERY" -jsonl -o "$NUCLEI_OUT" >/dev/null 2>&1 || true
+  if [ -s "$NUCLEI_OUT" ]; then
+    echo "[OK] Nuclei findings:"
+    cat "$NUCLEI_OUT"
+  else
+    echo "[i] Nuclei: rien."
+  fi
+else
+  echo "[i] Nuclei désactivé."
+fi
+echo

@@ -365,6 +365,7 @@ COPY --from=builder /out/bin/kubectl-who-can /opt/darkmoon/kube/kubectl-who-can
 COPY --from=builder /out/bin/kubeletctl      /opt/darkmoon/kube/kubeletctl
 COPY --from=builder /out/bin/rbac-police     /opt/darkmoon/kube/rbac-police
 COPY --from=builder /out/bin/ffuf            /opt/darkmoon/kube/ffuf
+COPY --from=builder /out/bin/subfinder       /opt/darkmoon/kube/subfinder
 
 
 

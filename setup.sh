@@ -362,6 +362,21 @@ fi
 msg "ffuf …"
 go_build_with_pins "https://github.com/ffuf/ffuf" "." "ffuf" || warn "ffuf KO"
 
+# 11) subfinder — DOC OFFICIELLE: go install (module v2)
+msg "subfinder …"
+
+GO111MODULE=on GOTOOLCHAIN=local \
+  go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+
+SUBFINDER_BIN="$(go env GOPATH)/bin/subfinder"
+
+if [ -x "$SUBFINDER_BIN" ]; then
+  install -D -m0755 "$SUBFINDER_BIN" "$KUBE_DIR/subfinder"
+  ok "subfinder install (go install)"
+else
+  warn "subfinder KO (binaire introuvable)"
+fi
+
 # Récapitulatif
 msg "Binaires installés dans $KUBE_DIR :"
 ls -lh "$KUBE_DIR" || true

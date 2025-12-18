@@ -1627,7 +1627,7 @@ std::string system_prompt =
 
     std::string full_history;
     std::string last_cmd1, last_cmd2;
-    const int MAX_STEPS = 30;
+    const int MAX_STEPS = 150;
 
     for (int step = 0; step < MAX_STEPS; step++)
     {
