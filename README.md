@@ -141,6 +141,7 @@ Voici **tous les outils réellement installés / présents dans l’image finale
 | `rbac-police`                    | build Go (setup.sh) + copy                   | `/opt/darkmoon/kube/rbac-police` + `/usr/local/bin/rbac-police`         | Peut être un **stub** si build échoue                                          |
 | `ffuf`                           | build Go (setup.sh)                          | `/out/bin/ffuf` (builder)                                               | /usr/local/bin/ |
 | `acl` (`setfacl`)                | `apt-get install acl`                        | `/usr/bin/setfacl`                                                      | Pour permissions par défaut `/opt/darkmoon/scripts`                            |
+| Subfinder | go install | énumération sous-domaines |
 
 
 
