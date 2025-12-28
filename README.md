@@ -23,6 +23,14 @@ Quand `zap` est **healthy**, tu peux lancer les scans.
 
 il est possible d'exécuter une campagne de pentest avec un prompt personalité qui est par defaut dans le répertoire `/prompt/`, il doit être placé à cet endroit et etre appelé via l'argument prompt-file
 
+
+Exécuter DarkMoon avec le wrapper :
+
+```bash
+chmod +x
+./darkmoon.sh -p dvga_extreme_autopwn.txt -b http://dvga:5013/
+```
+
 Commande type (réseau interne Compose : hôte `zap`, port `8888`, token lu dans le volume partagé `/zap/wrk`) :
 
 ```bash
