@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+msg(){ echo "[*] $*"; }
+ok(){ echo "[OK] $*"; }
+
+RUBY_PREFIX="/opt/darkmoon/ruby"
+RUBY_BIN="$RUBY_PREFIX/bin/ruby"
+GEM_BIN="$RUBY_PREFIX/bin/gem"
+BUNDLE_BIN="$RUBY_PREFIX/bin/bundle"
+BIN_OUT="/out/bin"
+
+
+# whatweb
+msg "Installing WhatWeb (Ruby)…"
+
+WHATWEB_DIR="/opt/darkmoon/whatweb"
+git clone --depth=1 https://github.com/urbanadventurer/WhatWeb "$WHATWEB_DIR"
+
+# Bundler
+"$GEM_BIN" install bundler --no-document
+
+cd "$WHATWEB_DIR"
+"$BUNDLE_BIN" install
+
+# wrapper
+cat >"$BIN_OUT/whatweb" <<'EOF'
+#!/bin/sh
+exec /opt/darkmoon/ruby/bin/ruby /opt/darkmoon/whatweb/whatweb "$@"
+EOF
+chmod +x "$BIN_OUT/whatweb"
+
+ok "WhatWeb installed"

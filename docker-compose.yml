@@ -4,75 +4,6 @@ volumes:
   zap-data: {}
 
 services:
-  zap:
-    image: ghcr.io/zaproxy/zaproxy:weekly
-    container_name: zap
-    user: "0:0"
-    environment:
-      ZAP_PORT: "8888"
-      # Optionnel : liste des add-ons à installer automatiquement (séparés par espaces)
-      ZAP_ADDONS: "openapi graphql soap ajaxSpider pscanrulesAlpha pscanrulesBeta ascanrulesAlpha ascanrulesBeta fuzz importurls retire communityScripts wappalyzer"
-      # Optionnel : tu peux aussi injecter toi-même la clé ici
-      # ZAP_API_TOKEN: "ta-cle-ultra-secrete"
-    volumes:
-      - zap-data:/zap/wrk
-    command: >
-      sh -lc '
-        set -eu
-        # 1) Générer/propager la clé comme AVANT (inchangé)
-        if [ -z "$${ZAP_API_TOKEN:-}" ]; then
-          TOKEN="$$(head -c 32 /dev/urandom | od -An -tx1 | tr -d " \n")"
-        else
-          TOKEN="$${ZAP_API_TOKEN}"
-        fi
-        export ZAP_API_TOKEN="$$TOKEN"
-        mkdir -p /zap/wrk
-        printf "%s" "$$TOKEN" > /zap/wrk/ZAP-API-TOKEN
-        printf "ZAP_API_TOKEN=%s\n" "$$TOKEN" > /zap/wrk/zap.env
-        printf "ZAP-API-TOKEN=%s\n" "$$TOKEN" > /zap/wrk/zap.env.hyphen
-        echo "[ZAP] API token: $$TOKEN"
-        echo "[ZAP] Proxy/API sur 0.0.0.0:${ZAP_PORT:-8888}"
-
-        # 2) Démarrer ZAP en daemon (clé inchangée)
-        /zap/zap.sh \
-          -daemon \
-          -host 0.0.0.0 \
-          -port "${ZAP_PORT:-8888}" \
-          -config api.key="$$TOKEN" \
-          -config api.addrs.addr.name=.* \
-          -config api.addrs.addr.regex=true \
-          -config spider.maxDuration=0 \
-          -config ajaxSpider.maxDuration=0 \
-          -config connection.timeoutInSecs=120 &
-        ZPID=$!
-
-        # 3) Attendre que l’API réponde
-        for i in $$(seq 1 60); do
-          if curl -sf "http://127.0.0.1:${ZAP_PORT:-8888}/JSON/core/view/version/" >/dev/null; then
-            break
-          fi
-          sleep 1
-        done
-
-        # 4) (Optionnel) Installer automatiquement les add-ons listés
-        if [ -n "$${ZAP_ADDONS:-}" ]; then
-          for A in $${ZAP_ADDONS}; do
-            echo "[ZAP] Installing addon: $$A"
-            curl -s "http://127.0.0.1:${ZAP_PORT:-8888}/JSON/autoupdate/action/installAddon/?id=$${A}&apikey=$${ZAP_API_TOKEN}" >/dev/null || true
-          done
-        fi
-
-        wait $$ZPID
-      '
-    healthcheck:
-      test: ["CMD-SHELL", "if command -v curl >/dev/null 2>&1; then curl -sf http://127.0.0.1:${ZAP_PORT:-8888}/JSON/core/view/version/ >/dev/null || exit 1; else wget -qO- http://127.0.0.1:${ZAP_PORT:-8888}/JSON/core/view/version/ >/dev/null || exit 1; fi"]
-      interval: 5s
-      timeout: 5s
-      retries: 60
-      start_period: 60s
-    ports:
-      - "8888:8888"
-    restart: unless-stopped
 
   darkmoon:
     build:
@@ -92,7 +23,4 @@ services:
       - NET_ADMIN
     environment:
       - DM_MODE=default
-    depends_on:
-      zap:
-        condition: service_started
     restart: unless-stopped

@@ -7,8 +7,8 @@ export GOTOOLCHAIN=local
 export GOFLAGS="${GOFLAGS:-} -buildvcs=false"
 
 # Où déposer les binaires buildés
-export KUBE_DIR="${KUBE_DIR:-/out/bin}"
-mkdir -p "$KUBE_DIR"
+export BIN_OUT="${BIN_OUT:-/out/bin}"
+mkdir -p "$BIN_OUT"
 
 # Helpers utilisés plus bas
 msg(){ echo "[*] $*"; }
@@ -30,217 +30,86 @@ ensure_build_deps() {
   fi
 }
 
-# Builder générique avec pins (utilisé pour quelques utilitaires simples)
-go_build_with_pins(){
-  local repo="$1" sub="$2" out="$3"; shift 3 || true
-  local tmp; tmp="$(mktemp -d)"
-  git clone --depth=1 "$repo" "$tmp/src"
-  (
-    cd "$tmp/src/${sub}"
-    # Pins communs
-    go get "golang.org/x/crypto@${PIN_X_CRYPTO}"
-    go get "golang.org/x/net@${PIN_X_NET}"
-    go get "golang.org/x/text@${PIN_X_TEXT}"
-    go get "google.golang.org/protobuf@${PIN_PROTOBUF}"
-    go get "gopkg.in/yaml.v3@${PIN_YAML_V3}"
-    # Commandes supplémentaires éventuelles passées en arguments
-    for cmd in "$@"; do [ -n "${cmd:-}" ] && eval "$cmd"; done
-    go mod tidy
-    CGO_ENABLED="${CGO_ENABLED_OVERRIDE:-0}" go build -trimpath -ldflags="-s -w" -o "$KUBE_DIR/$out" .
-  )
-  rm -rf "$tmp"
-  [ -x "$KUBE_DIR/$out" ] && ok "$out build" || warn "$out KO"
-}
-# --- FIN PROLOGUE ---
+ensure_build_deps
 
-# Pins (conservés si besoin de build local, mais inutiles pour go install @latest)
-PIN_X_CRYPTO="v0.37.0"
-PIN_X_NET="v0.41.0"
-PIN_X_TEXT="v0.15.0"
-PIN_OAUTH2="v0.27.0"
-PIN_YAML_V3="v3.0.1"
-PIN_PROTOBUF="v1.34.2"
+# 1) ---- kubeletctl — DOC OFFICIELLE: binary release ---- 
+msg "kubeletctl …"
 
-msg "Installation des outils dans $KUBE_DIR (FORCAGE build pin + CGO si besoin)"
+KUBELETCTL_VERSION="v1.13"
+KUBELETCTL_URL="https://github.com/cyberark/kubeletctl/releases/download/${KUBELETCTL_VERSION}/kubeletctl_linux_amd64"
+TMP_KUBELETCTL="/tmp/kubeletctl"
 
-# 0) waybackurls
-msg "waybackurls …"
-go_build_with_pins "https://github.com/tomnomnom/waybackurls" "." "waybackurls" || warn "waybackurls KO"
+curl -fsSL "$KUBELETCTL_URL" -o "$TMP_KUBELETCTL"
+chmod +x "$TMP_KUBELETCTL"
 
-# 1) kubectl-who-can — build durci avec pins de dépendances
-msg "kubectl-who-can (hardened) …"
-CGO_ENABLED_OVERRIDE=0 \
-go_build_with_pins \
-  "https://github.com/aquasecurity/kubectl-who-can" \
-  "cmd/kubectl-who-can" \
-  "kubectl-who-can" \
-  'go get golang.org/x/crypto@v0.35.0' \
-  'go get golang.org/x/net@v0.39.0' \
-  'go get golang.org/x/oauth2@v0.27.0' \
-  'go get github.com/nwaples/rardecode/v2@v2.2.0' \
-  'go get github.com/ulikunitz/xz@v0.5.15' \
-  || warn "kubectl-who-can KO"
-
-# 2) kubeletctl — build durci depuis les sources
-msg "kubeletctl (hardened) …"
-
-KUBELETCTL_REPO="https://github.com/cyberark/kubeletctl"
-tmp="$(mktemp -d)"
-
-git clone --depth=1 "$KUBELETCTL_REPO" "$tmp/src"
-
-(
-  set -e
-  cd "$tmp/src"
-
-  # 0) Remplacer jwt-go vulnérable par le fork maintenu
-  if grep -R "github.com/dgrijalva/jwt-go" -n . >/dev/null 2>&1; then
-    grep -rl "github.com/dgrijalva/jwt-go" . \
-      | xargs sed -i 's#"github.com/dgrijalva/jwt-go"#"github.com/golang-jwt/jwt/v4"#g'
-  fi
-
-  # 1) Monter les libs Go critiques à des versions patchées (en dur)
-  go get github.com/golang-jwt/jwt/v4@v4.5.2
-
-  go get golang.org/x/crypto@v0.37.0
-  go get golang.org/x/net@v0.41.0
-  go get golang.org/x/text@v0.22.0
-  go get golang.org/x/oauth2@v0.27.0
-
-  # 2) Deps vulnérables spécifiques kubeletctl
-  go get go.mongodb.org/mongo-driver@v1.15.0
-  go get github.com/gogo/protobuf@v1.3.2
-
-  # ⚠ On ne touche pas (pour l’instant) à k8s.io/* pour ne pas casser la compat
-  # Si besoin on fera un deuxième round juste sur ces deps.
-
-  # 3) Nettoyage du graph de dépendances
-  go mod tidy
-
-  # 4) Build du binaire kubeletctl (doc officielle : build à la racine)
-  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$KUBE_DIR/kubeletctl" .
-)
-
-rm -rf "$tmp"
-
-if [ -x "$KUBE_DIR/kubeletctl" ]; then
-  ok "kubeletctl build (hardened)"
+if "$TMP_KUBELETCTL" version >/dev/null 2>&1 || "$TMP_KUBELETCTL" help >/dev/null 2>&1; then
+  install -D -m0755 "$TMP_KUBELETCTL" "$BIN_OUT/kubeletctl"
+  ok "kubeletctl install (${KUBELETCTL_VERSION})"
 else
-  warn "kubeletctl KO (hardened) – binaire non généré"
-  exit 1
+  warn "kubeletctl KO (binaire invalide)"
 fi
 
-# 4) kubescape — version figée (fix incompatibilité docker/buildx)
-msg "kubescape (version stable v3.0.9)…"
+rm -f "$TMP_KUBELETCTL"
 
-KUBESCAPE_REPO="https://github.com/kubescape/kubescape"
-tmp="$(mktemp -d)"
 
-git clone "$KUBESCAPE_REPO" "$tmp/src"
+# 2) ---- kubescape — DOC OFFICIELLE: install.sh ----
+msg "kubescape …"
 
-(
-  set -e
-  cd "$tmp/src"
+TMP_KUBESCAPE_DIR="$(mktemp -d)"
 
-  # Figer sur une version compatible (évite les erreurs moby/moby vs docker/docker)
-  git checkout v3.0.9
+curl -fsSL https://raw.githubusercontent.com/kubescape/kubescape/master/install.sh \
+  | bash -s -- -b "$TMP_KUBESCAPE_DIR"
 
-  # Build propre
-  CGO_ENABLED=0 GO111MODULE=on GOTOOLCHAIN=local \
-    go build -trimpath -ldflags="-s -w" -o "$KUBE_DIR/kubescape" .
-)
-
-rm -rf "$tmp"
-
-if [ -x "$KUBE_DIR/kubescape" ]; then
-  ok "kubescape build (v3.0.9)"
+if [ -x "$TMP_KUBESCAPE_DIR/kubescape" ]; then
+  install -D -m0755 "$TMP_KUBESCAPE_DIR/kubescape" "$BIN_OUT/kubescape"
+  ok "kubescape install (official install.sh)"
 else
-  warn "kubescape KO (v3.0.9)"
+  warn "kubescape KO (binaire introuvable)"
 fi
 
-# 5) rbac-police — build local durci (plus de binaire précompilé)
-msg 'rbac-police (hardened from source) …'
+rm -rf "$TMP_KUBESCAPE_DIR"
 
-RBAC_OUT="$KUBE_DIR/rbac-police"
-RBAC_REPO="https://github.com/PaloAltoNetworks/rbac-police"
-tmp="$(mktemp -d)"
-tmp_ok=""
 
-if git clone --depth=1 "$RBAC_REPO" "$tmp/src"; then
-  (
-    set -e
-    cd "$tmp/src"
+# 3) ---- rbac-police — DOC OFFICIELLE: go install ----
+msg "rbac-police …"
 
-    #
-    # 1) Monter les dépendances critiques à des versions patchées
-    #
+GO111MODULE=on GOTOOLCHAIN=local \
+  go install github.com/PaloAltoNetworks/rbac-police@latest
 
-    # 🔹 OPA — CVE-2025-46569 (fix officiel en v1.4.0)
-    # On essaie d'abord v1.4.0 en force (require + replace)
-    if go mod edit -require=github.com/open-policy-agent/opa@v1.4.0 \
-       && go mod edit -replace=github.com/open-policy-agent/opa=github.com/open-policy-agent/opa@v1.4.0; then
-      go get github.com/open-policy-agent/opa@v1.4.0 || true
-    else
-      warn "go mod edit OPA@v1.4.0 KO, tentative fallback v0.68.0 (sans fix complet CVE-2025-46569)"
-      go mod edit -require=github.com/open-policy-agent/opa@v0.68.0 || true
-      go mod edit -replace=github.com/open-policy-agent/opa=github.com/open-policy-agent/opa@v0.68.0 || true
-      go get github.com/open-policy-agent/opa@v0.68.0 || true
-    fi
-
-    # 🔹 x/* & compagnies
-    # x/net — CVE-2025-22870/22872 : prendre une version récente (>=0.38.0)
-    go mod edit -require=golang.org/x/net@v0.46.0 || true
-    go mod edit -replace=golang.org/x/net=golang.org/x/net@v0.46.0 || true
-    go get golang.org/x/net@v0.46.0 || true
-
-    # crypto / oauth2 / sys / text / protobuf / yaml — mêmes versions que pour le reste de ton setup
-    go mod edit -require=golang.org/x/crypto@v0.37.0 || true
-    go mod edit -require=golang.org/x/oauth2@v0.27.0 || true
-    go mod edit -require=golang.org/x/sys@v0.26.0 || true
-    go mod edit -require=golang.org/x/text@v0.15.0 || true
-    go mod edit -require=google.golang.org/protobuf@v1.34.2 || true
-    go mod edit -require=gopkg.in/yaml.v3@v3.0.1 || true
-
-    go get golang.org/x/crypto@v0.37.0 || true
-    go get golang.org/x/oauth2@v0.27.0 || true
-    go get golang.org/x/sys@v0.26.0 || true
-    go get golang.org/x/text@v0.15.0 || true
-    go get google.golang.org/protobuf@v1.34.2 || true
-    go get gopkg.in/yaml.v3@v3.0.1 || true
-
-    #
-    # (optionnel mais utile pour debug)
-    #
-    go list -m github.com/open-policy-agent/opa golang.org/x/net || true
-
-    #
-    # 2) Nettoyage du graph de dépendances
-    #
-    go mod tidy
-
-    #
-    # 3) Build du binaire (doc officielle: go build à la racine)
-    #
-    CGO_ENABLED=0 GO111MODULE=on GOTOOLCHAIN=local \
-      go build -trimpath -ldflags="-s -w" -o "$RBAC_OUT" .
-  ) && tmp_ok="yes" || warn "rbac-police hardened build KO"
+RBAC_POLICE_BIN="$(go env GOPATH)/bin/rbac-police"
+if [ -x "$RBAC_POLICE_BIN" ]; then
+  install -D -m0755 "$RBAC_POLICE_BIN" "$BIN_OUT/rbac-police"
+  ok "rbac-police install (go install)"
 else
-  warn "git clone rbac-police KO (réseau / GitHub ?)"
+  warn "rbac-police KO (binaire introuvable)"
 fi
 
-rm -rf "$tmp"
+# 4) ---- naabu — DOC OFFICIELLE: go install (v2) ----
+msg "naabu …"
 
-if [ -n "$tmp_ok" ] && [ -x "$RBAC_OUT" ]; then
-  ok "rbac-police build (hardened from source)"
+GO111MODULE=on GOTOOLCHAIN=local \
+  go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+
+NAABU_BIN="$(go env GOPATH)/bin/naabu"
+if [ -x "$NAABU_BIN" ]; then
+  install -D -m0755 "$NAABU_BIN" "$BIN_OUT/naabu"
+  ok "naabu install (go install)"
 else
-  warn "rbac-police indisponible (build durci échoué). Création d’un stub."
-  cat >"$RBAC_OUT"<<'EOF'
-#!/bin/sh
-echo "[WARN] rbac-police n'a pas pu être téléchargé/compilé lors du build."
-echo "       Vérifie la connectivité GitHub et les dépendances Go (OPA, x/*, protobuf, yaml)."
-exit 126
-EOF
-  chmod +x "$RBAC_OUT"
+  warn "naabu KO (binaire introuvable)"
+fi
+
+# 5) ---- httpx — DOC OFFICIELLE: go install ----
+msg "httpx …"
+
+GO111MODULE=on GOTOOLCHAIN=local \
+  go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+
+HTTPX_BIN="$(go env GOPATH)/bin/httpx"
+if [ -x "$HTTPX_BIN" ]; then
+  install -D -m0755 "$HTTPX_BIN" "$BIN_OUT/httpx"
+  ok "httpx install (go install)"
+else
+  warn "httpx KO (binaire introuvable)"
 fi
 
 # 6) katana — DOC OFFICIELLE: go install
@@ -249,90 +118,12 @@ CGO_ENABLED=1 GO111MODULE=on GOTOOLCHAIN=local \
   go install github.com/projectdiscovery/katana/cmd/katana@latest
 KATANA_BIN="$(go env GOPATH)/bin/katana"
 if [ -x "$KATANA_BIN" ]; then
-  install -D -m0755 "$KATANA_BIN" "$KUBE_DIR/katana"
+  install -D -m0755 "$KATANA_BIN" "$BIN_OUT/katana"
   ok "katana install (go install)"
 else
   warn "katana KO (binaire introuvable)"
 fi
 
-# 6) naabu — build local avec deps patchées (au lieu de go install direct)
-msg "naabu (hardened) …"
-
-NAABU_REPO="https://github.com/projectdiscovery/naabu"
-tmp="$(mktemp -d)"
-
-# Versions patchées (à ajuster au besoin si upstream change)
-PIN_RARDECODE_V2="v2.2.0"
-PIN_XZ="v0.5.15"
-PIN_OAUTH2="v0.27.0"
-
-git clone --depth=1 "$NAABU_REPO" "$tmp/src"
-(
-  cd "$tmp/src"
-
-  # On est à la racine du module (go.mod), pas dans /v2/
-  # On force les versions sûres des dépendances vulnérables
-  go get "github.com/nwaples/rardecode/v2@${PIN_RARDECODE_V2}"
-  go get "github.com/ulikunitz/xz@${PIN_XZ}"
-  go get "golang.org/x/oauth2@${PIN_OAUTH2}"
-
-  go mod tidy
-
-  # 1er essai : binaire sans CGO (pas de scan full mais moins chiant)
-  if CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$KUBE_DIR/naabu" ./cmd/naabu; then
-    ok "naabu build (CGO=0, deps patchées)"
-  else
-    warn "naabu CGO=0 KO, tentative avec CGO=1 (libpcap)"
-    ensure_build_deps
-    if CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o "$KUBE_DIR/naabu" ./cmd/naabu; then
-      ok "naabu build (CGO=1, deps patchées)"
-    else
-      warn "naabu KO même avec CGO=1, aucun binaire généré"
-    fi
-  fi
-)
-
-rm -rf "$tmp"
-[ -x "$KUBE_DIR/naabu" ] || warn "naabu non présent dans $KUBE_DIR (build échoué)"
-
-# 7) httpx — build durci avec deps patchées
-msg "httpx (hardened) …"
-
-HTTPX_REPO="https://github.com/projectdiscovery/httpx"
-tmp="$(mktemp -d)"
-
-git clone --depth=1 "$HTTPX_REPO" "$tmp/src"
-
-(
-  set -e
-  cd "$tmp/src"
-
-  # Patch des dépendances vulnérables signalées par Trivy
-  go get github.com/go-viper/mapstructure/v2@v2.4.0
-  go get github.com/nwaples/rardecode/v2@v2.2.0
-  go get github.com/ulikunitz/xz@v0.5.15
-  go get golang.org/x/oauth2@v0.27.0
-
-  # IMPORTANT : forcer tlsx à la version attendue par httpx
-  # (logs : "downgraded ... tlsx v1.2.1 => v1.1.9", donc on le remonte)
-  go get github.com/projectdiscovery/tlsx@v1.2.1
-
-  # Nettoyage du graph de dépendances
-  go mod tidy
-
-  # Build du binaire httpx
-  CGO_ENABLED=0 GO111MODULE=on GOTOOLCHAIN=local \
-    go build -trimpath -ldflags="-s -w" \
-      -o "$KUBE_DIR/httpx" ./cmd/httpx
-)
-
-rm -rf "$tmp"
-
-if [ -x "$KUBE_DIR/httpx" ]; then
-  ok "httpx build (hardened)"
-else
-  warn "httpx KO (hardened build)"
-fi
 
 # 8) nuclei — DOC OFFICIELLE: go install (module v3)
 msg "nuclei …"
@@ -340,7 +131,7 @@ GO111MODULE=on GOTOOLCHAIN=local \
   go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 NUCLEI_BIN="$(go env GOPATH)/bin/nuclei"
 if [ -x "$NUCLEI_BIN" ]; then
-  install -D -m0755 "$NUCLEI_BIN" "$KUBE_DIR/nuclei"
+  install -D -m0755 "$NUCLEI_BIN" "$BIN_OUT/nuclei"
   ok "nuclei install (go install)"
 else
   warn "nuclei KO (binaire introuvable)"
@@ -352,7 +143,7 @@ GO111MODULE=on GOTOOLCHAIN=local \
   go install github.com/zmap/zgrab2/cmd/zgrab2@latest
 ZGRAB2_BIN="$(go env GOPATH)/bin/zgrab2"
 if [ -x "$ZGRAB2_BIN" ]; then
-  install -D -m0755 "$ZGRAB2_BIN" "$KUBE_DIR/zgrab2"
+  install -D -m0755 "$ZGRAB2_BIN" "$BIN_OUT/zgrab2"
   ok "zgrab2 install (go install)"
 else
   warn "zgrab2 KO (binaire introuvable)"
@@ -371,12 +162,111 @@ GO111MODULE=on GOTOOLCHAIN=local \
 SUBFINDER_BIN="$(go env GOPATH)/bin/subfinder"
 
 if [ -x "$SUBFINDER_BIN" ]; then
-  install -D -m0755 "$SUBFINDER_BIN" "$KUBE_DIR/subfinder"
+  install -D -m0755 "$SUBFINDER_BIN" "$BIN_OUT/subfinder"
   ok "subfinder install (go install)"
 else
   warn "subfinder KO (binaire introuvable)"
 fi
 
+# 12) kube-bench — DOC OFFICIELLE: go install
+msg "kube-bench …"
+GO111MODULE=on GOTOOLCHAIN=local \
+  go install github.com/aquasecurity/kube-bench@latest
+
+KUBE_BENCH_BIN="$(go env GOPATH)/bin/kube-bench"
+if [ -x "$KUBE_BENCH_BIN" ]; then
+  install -D -m0755 "$KUBE_BENCH_BIN" "$BIN_OUT/kube-bench"
+  ok "kube-bench install (go install)"
+else
+  warn "kube-bench KO (binaire introuvable)"
+fi
+
+# 13) grpcurl — DOC OFFICIELLE: go install
+msg "grpcurl …"
+GO111MODULE=on GOTOOLCHAIN=local \
+  go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
+
+GRPCURL_BIN="$(go env GOPATH)/bin/grpcurl"
+if [ -x "$GRPCURL_BIN" ]; then
+  install -D -m0755 "$GRPCURL_BIN" "$BIN_OUT/grpcurl"
+  ok "grpcurl install (go install)"
+else
+  warn "grpcurl KO (binaire introuvable)"
+fi
+
+# 14) ---- DIRB (autotools + libcurl custom) ----
+msg "dirb …"
+
+DIRB_REPO="https://github.com/v0re/dirb"
+DIRB_SRC="/tmp/dirb"
+OUT="/out"
+CURL_PREFIX="/out/curl"
+
+rm -rf "$DIRB_SRC"
+git clone --depth=1 "$DIRB_REPO" "$DIRB_SRC"
+cd "$DIRB_SRC"
+
+# rendre visible la libcurl custom
+export PATH="${CURL_PREFIX}/bin:${PATH}"
+export PKG_CONFIG_PATH="${CURL_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+export CPPFLAGS="-I${CURL_PREFIX}/include"
+export LDFLAGS="-L${CURL_PREFIX}/lib -Wl,-rpath,${CURL_PREFIX}/lib"
+export CFLAGS="-O2 -pipe -fPIC -fcommon"
+
+# sanity check libcurl
+if [ ! -x "${CURL_PREFIX}/bin/curl-config" ]; then
+  echo "[FATAL] curl-config introuvable dans ${CURL_PREFIX}/bin"
+  exit 1
+fi
+
+# configure (DIRB ignore --with-curl, mais garde les flags)
+./configure --prefix="$OUT"
+
+make clean || true
+make -j"$(nproc)"
+
+# installation manuelle
+install -d "$OUT/bin" "$OUT/wordlists/dirb"
+install -m 0755 "src/dirb" "$OUT/bin/dirb"
+cp -a "wordlists/." "$OUT/wordlists/dirb/"
+
+# vérification safe (dirb -h retourne 255 → ne pas casser set -e)
+"$OUT/bin/dirb" -h >/dev/null 2>&1 || true
+
+ok "dirb install (libcurl custom)"
+
+# 15) ---- kubectl — DOC OFFICIELLE: binary release ----
+msg "kubectl …"
+
+KUBECTL_URL="https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+TMP_KUBECTL="/tmp/kubectl"
+
+curl -fsSL "$KUBECTL_URL" -o "$TMP_KUBECTL"
+chmod +x "$TMP_KUBECTL"
+
+if "$TMP_KUBECTL" version --client >/dev/null 2>&1; then
+  install -D -m0755 "$TMP_KUBECTL" "$BIN_OUT/kubectl"
+  ok "kubectl install (official binary)"
+else
+  warn "kubectl KO (binaire invalide)"
+fi
+
+rm -f "$TMP_KUBECTL"
+
+# 16) ---- waybackurls — DOC OFFICIELLE: go install ----
+msg "waybackurls …"
+
+GO111MODULE=on GOTOOLCHAIN=local \
+  go install github.com/tomnomnom/waybackurls@latest
+
+WAYBACKURLS_BIN="$(go env GOPATH)/bin/waybackurls"
+if [ -x "$WAYBACKURLS_BIN" ]; then
+  install -D -m0755 "$WAYBACKURLS_BIN" "$BIN_OUT/waybackurls"
+  ok "waybackurls install (go install)"
+else
+  warn "waybackurls KO (binaire introuvable)"
+fi
+
 # Récapitulatif
-msg "Binaires installés dans $KUBE_DIR :"
-ls -lh "$KUBE_DIR" || true
+msg "Binaires installés dans $BIN_OUT :"
+ls -lh "$BIN_OUT" || true

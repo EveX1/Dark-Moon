@@ -1,95 +1,298 @@
-# Build & run
+# 🧰 Darkmoon Toolbox 
 
-## Build de la stack
+## 1. À quoi sert ce projet ?
 
-```bash
-docker compose up -d --build
-```
+Ce projet sert à :
 
-> Repère sur ta machine : ~1200 s pour le build initial.
+* Construire une **toolbox de cybersécurité**.
+* Mettre beaucoup d’outils dans **une seule image Docker**.
+* Avoir une image :
 
-## Vérifier que tout est OK
+  * fiable,
+  * reproductible,
+  * facile à maintenir,
+  * facile à étendre.
 
-```bash
-docker compose ps
-docker compose logs -f zap | sed -n '1,60p'
-```
+Cette image est destinée :
 
-Quand `zap` est **healthy**, tu peux lancer les scans.
-
----
-
-# Exécuter un pentest Web & autres stacks
-
-il est possible d'exécuter une campagne de pentest avec un prompt personalité qui est par defaut dans le répertoire `/prompt/`, il doit être placé à cet endroit et etre appelé via l'argument prompt-file
-
-
-Exécuter DarkMoon avec le wrapper :
-
-```bash
-chmod +x
-./darkmoon.sh -p dvga_extreme_autopwn.txt -b http://dvga:5013/
-```
-
-Commande type (réseau interne Compose : hôte `zap`, port `8888`, token lu dans le volume partagé `/zap/wrk`) :
-
-```bash
-docker compose exec darkmoon bash -lc './agentfactory \
-  --prompt-file dvga_extreme_autopwn.txt \
-  --baseurl "http://dvga:5013/" \
-  --http-env dvga.env'
-```
-
-Sorties attendues : un dossier de travail sous `"$DM_HOME/zap_cli_out/..."` contenant les artefacts (katana, ZAP, recon, rapports, etc.).
+* aux **pentesters**,
+* aux **ingénieurs sécurité**,
+* aux **chercheurs**,
+* à la **communauté Open Source**.
 
 ---
 
-# Exécuter un pentest Kubernetes
+## 2. Principe général (idée simple)
 
-## Préparer le kubeconfig pour le conteneur
+Ce projet utilise **Docker** avec **deux étapes** :
 
-Deux options :
+### Étape 1 : Builder
 
-**Option A (sans modifier compose)** — Copie ton kubeconfig dans le volume déjà monté :
+* On **compile**.
+* On **installe**.
+* On **prépare** tous les outils.
+* Rien n’est encore destiné à l’utilisateur final.
 
-```bash
-cp ~/.kube/config "$HOME/darkmoon-docker-fs/kubeconfig"
-```
+### Étape 2 : Runtime
 
-**Option B (si tu préfères monter ~/.kube en lecture seule)** — Ajoute ceci dans `docker-compose.yml` (service `darkmoon`, section `volumes`) :
+* On **copie seulement le résultat utile**.
+* On enlève tout ce qui n’est pas nécessaire.
+* L’image finale est **plus petite** et **plus propre**.
 
-```yaml
-- ${HOME}/.kube:/root/.kube:ro
-```
+👉 Cette séparation est volontaire.
+👉 Elle évite les erreurs et réduit les risques.
 
-Puis tu pourras utiliser `--kubeconfig "/root/.kube/config"` dans la commande.
-
-## Commande type (Option A, kubeconfig dans le volume)
-
-```bash
-docker compose exec darkmoon bash -lc './agentfactory \
-  --k8s \
-  --prompt-file /opt/darkmoon/prompt/dvga_extreme_autopwn.txt \
-  --baseurl "http://localhost:1230"'   
-'
-```
-
-## Commande type (Option B, kubeconfig monté en /root/.kube)
-
-```bash
-docker compose exec darkmoon bash -lc '
-  cd "$DM_HOME" \
-  && ./agentfactory \
-       --k8s \
-       --kubeconfig "/root/.kube/config" \
-       --context "kind-hacklab" \
-       --outdir "./out" \
-       --baseurl "http://localhost:1230"
-'
-```
 ---
 
-# Liste de la toolbox:
+## 3. Pourquoi cette architecture est intelligente
+
+### 3.1 Séparation claire des rôles
+
+Chaque fichier a **un seul rôle** :
+
+* `Dockerfile`
+
+  * Gère le système.
+  * Installe les langages.
+  * Copie les résultats.
+* `setup.sh`
+
+  * Installe les outils **binaires** (Go, GitHub releases, compilation C).
+* `setup_ruby.sh`
+
+  * Installe les outils **Ruby**.
+* `setup_py.sh`
+
+  * Installe les outils **Python**.
+  * Crée des commandes simples (`netexec`, `sqlmap`, etc.).
+
+👉 Cela évite les scripts “magiques”.
+👉 Tout est lisible et vérifiable.
+
+---
+
+### 3.2 Sortie standardisée
+
+Tous les outils compilés sortent **au même endroit** :
+
+```
+/out/bin
+```
+
+Puis ils sont exposés dans :
+
+```
+/usr/local/bin
+```
+
+👉 Une règle simple :
+
+* **si un outil est dans `/out/bin`, il sera utilisable**.
+
+---
+
+### 3.3 Optimisations importantes
+
+* Suppression des caches APT.
+* Suppression de `apt` et `dpkg` en runtime.
+* Pas de compilateur dans l’image finale.
+* Langages compilés une seule fois.
+
+👉 Résultat :
+
+* image plus petite,
+* surface d’attaque réduite,
+* comportement stable.
+
+---
+
+## 4. Que contient l’image ?
+
+### 4.1 Système de base
+
+* OS : Debian Bookworm (version slim)
+* Outils système essentiels :
+
+  * `bash`
+  * `curl`
+  * `jq`
+  * `dnsutils`
+  * `openssh-client`
+  * `hydra`
+  * `snmp`
+
+---
+
+### 4.2 Langages intégrés
+
+* **Go**
+
+  * utilisé pour compiler beaucoup d’outils réseau et sécurité
+* **Python** (version compilée)
+
+  * installé dans `/opt/darkmoon/python`
+* **Ruby** (version compilée)
+
+  * installé dans `/opt/darkmoon/ruby`
+
+👉 Les versions sont **fixées** pour éviter les surprises.
+
+---
+
+### 4.3 Wordlists
+
+* **SecLists**
+
+  * accessibles via :
+
+    * `/usr/share/seclists`
+    * `/usr/share/wordlists/seclists`
+* Wordlists **DIRB**
+
+  * accessibles via `/usr/share/dirb/wordlists`
+
+---
+
+### 4.4 Outils installés (exemples)
+
+Les outils sont installés via les scripts :
+
+* Scan réseau
+* Scan web
+* Kubernetes
+* Active Directory
+* HTTP / DNS / RPC
+
+Exemples (non exhaustifs) :
+
+* `nuclei`
+* `naabu`
+* `httpx`
+* `ffuf`
+* `dirb`
+* `kubectl`
+* `kubeletctl`
+* `kubescape`
+* `netexec`
+* `sqlmap`
+* `wafw00f`
+
+👉 Tous sont accessibles directement dans le terminal.
+
+---
+
+## 5. Comment utiliser l’image
+
+### 5.1 Construire l’image
+
+```bash
+docker build -t darkmoon .
+```
+
+### 5.2 Lancer un shell
+
+```bash
+docker run -it darkmoon bash
+```
+
+### 5.3 Utiliser un outil
+
+```bash
+nuclei -h
+naabu -h
+netexec -h
+```
+
+👉 Aucun chemin compliqué n’est nécessaire.
+
+---
+
+## 6. Comment ajouter un nouvel outil (pour la communauté)
+
+### 6.1 Choisir le bon endroit
+
+| Type d’outil        | Où l’ajouter         |
+| ------------------- | -------------------- |
+| Outil Go / binaire  | `setup.sh`           |
+| Outil Python        | `setup_py.sh`        |
+| Lib système runtime | Dockerfile (runtime) |
+| Lib de compilation  | Dockerfile (builder) |
+
+---
+
+### 6.2 Règles à respecter
+
+* Un outil = un bloc clair.
+* Toujours afficher un message :
+
+  * `msg "outil …"`
+* Toujours vérifier l’installation :
+
+  * `tool -h` ou `tool --version`
+* Toujours installer dans :
+
+  * `/out/bin` (pour les binaires)
+* Ne pas mélanger les responsabilités.
+
+---
+
+### 6.3 Exemple simple (outil Go)
+
+```bash
+msg "exampletool …"
+go install github.com/example/exampletool@latest
+install -m 755 "$(go env GOPATH)/bin/exampletool" "$BIN_OUT/exampletool"
+```
+
+---
+
+## 7. Comment maintenir le projet
+
+### En cas d’erreur :
+
+* Lire le log.
+* Identifier si le problème vient :
+
+  * de Go,
+  * de Python,
+  * d’APT,
+  * d’une compilation C.
+
+### Bonnes pratiques :
+
+* Ne pas ajouter de dépendance inutile.
+* Ne pas casser la structure existante.
+* Tester avant de proposer une contribution.
+
+---
+
+## 8. Pour la communauté Open Source
+
+Ce projet est fait pour :
+
+* être **lu**,
+* être **compris**,
+* être **amélioré**.
+
+Si vous proposez une contribution :
+
+* soyez clair,
+* soyez factuel,
+* respectez l’architecture.
+
+---
+
+## 9. Résumé très court
+
+* Deux étapes : **builder → runtime**
+* Scripts séparés et clairs
+* Outils centralisés dans `/out/bin`
+* Exécution simple via `/usr/local/bin`
+* Image propre, stable et maintenable
+
+---
+
+## 10. Liste de la toolbox:
 
 Voici **tous les outils réellement installés / présents dans l’image finale** via **Dockerfile + setup.sh + setup_py.sh** (et les symlinks/wrappers), dans un tableau.
 
@@ -196,12 +399,7 @@ Ces scripts sont installés comme commandes dans `/opt/darkmoon/python/bin/` (do
 
 ---
 
-# Scripts:
-
-deux scripts disponible dans `/scripts/` sont disponible orchestrant les tools préinstallés, ces derniers snt accompagnés d'une documentation pur chacuns d'entres eux
-
-
-# TODO: Laboratoire à pentester pour entrainer DarkMoon
+# BONUS: Laboratoire de pentester pour entrainer DarkMoon
 
 ---
 

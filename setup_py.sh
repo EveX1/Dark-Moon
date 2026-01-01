@@ -54,6 +54,16 @@ EOF
 chmod +x /usr/local/bin/impacket-smbclient
 
 # netexec (ex-CrackMapExec) – utilise les binaires installés par pip (nxc / netexec)
+
+PYTHON_BIN="/opt/darkmoon/python/bin"
+# Installation de NetExec
+"$PIP_BIN" install --no-cache-dir \
+  "git+https://github.com/Pennyw0rth/NetExec.git@v1.4.0"
+
+# Vérification des binaires installés
+echo "=== NetExec binaries dans ${PYTHON_BIN} ==="
+command -v nxc >/dev/null 2>&1 && nxc --help | head -n1 || true
+
 cat >/usr/local/bin/netexec <<'EOF'
 #!/bin/sh
 if [ -x /opt/darkmoon/python/bin/nxc ]; then
