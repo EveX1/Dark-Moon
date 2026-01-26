@@ -17,6 +17,9 @@ msg "Installing WhatWeb (Ruby)…"
 WHATWEB_DIR="/opt/darkmoon/whatweb"
 git clone --depth=1 https://github.com/urbanadventurer/WhatWeb "$WHATWEB_DIR"
 
+# Validation que le fichier principal existe
+test -f "$WHATWEB_DIR/whatweb" || { echo "ERROR: whatweb script not found in $WHATWEB_DIR"; exit 1; }
+
 # Bundler
 "$GEM_BIN" install bundler --no-document
 
@@ -29,5 +32,8 @@ cat >"$BIN_OUT/whatweb" <<'EOF'
 exec /opt/darkmoon/ruby/bin/ruby /opt/darkmoon/whatweb/whatweb "$@"
 EOF
 chmod +x "$BIN_OUT/whatweb"
+
+# Vérification finale
+test -x "$BIN_OUT/whatweb" || { echo "ERROR: whatweb wrapper not created"; exit 1; }
 
 ok "WhatWeb installed"

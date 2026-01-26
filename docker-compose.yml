@@ -1,7 +1,7 @@
 name: darkmoon-stack
 
 volumes:
-  zap-data: {}
+  darkmoon_opencode:
 
 services:
 
@@ -12,15 +12,33 @@ services:
     container_name: darkmoon
     user: "0:0"
     volumes:
-      - ./prompt:/opt/darkmoon/prompt
-      - ./scripts:/opt/darkmoon/scripts 
-      - ${HOME}/darkmoon-docker-fs:/opt/darkmoon/zap_cli_out
-      - ${HOME}/darkmoon-docker-fs:/opt/darkmoon/out
-      - zap-data:/zap/wrk:ro
+      - /var/run/docker.sock:/var/run/docker.sock
       - ~/.kube:/root/.kube:ro
+
     cap_add:
       - NET_RAW
       - NET_ADMIN
     environment:
       - DM_MODE=default
     restart: unless-stopped
+
+  opencode:
+    build:
+      context: .
+      dockerfile: Dockerfile.opencode
+    container_name: opencode
+    stdin_open: true     # équivalent -it
+    tty: true
+    restart: unless-stopped
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/app/data
+      - ./darkmoon-settings:/root/.config/opencode/:rw
+      - ./darkmoon-settings:/root/.local/share/opencode/:rw
+      - ./darkmoon-settings/agents:/root/.opencode/agents/:rw
+      - ./workflows:/opt/darkmoon/mcp/server/src/tools/workflows/:rw
+
+    environment:
+      - TERM=xterm-256color
+      - LANG=C.UTF-8

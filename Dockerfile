@@ -14,7 +14,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 WORKDIR /build
 
 # ------------------------------------------------------------
-# Build dependencies (groupées & minimales)
+# Build dependencies
 # ------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential curl git unzip ca-certificates pkg-config \
@@ -26,7 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 # ------------------------------------------------------------
-# libcurl custom (latest officiel)
+# libcurl custom
 # ------------------------------------------------------------
 RUN set -eux; \
     CURL_VER="$(curl -fsSL https://curl.se/download/ \
@@ -45,7 +45,7 @@ RUN set -eux; \
 ENV PKG_CONFIG_PATH=${OUT}/curl/lib/pkgconfig
 
 # ------------------------------------------------------------
-# Go tools (via setup.sh)
+# Go tools
 # ------------------------------------------------------------
 COPY setup.sh .
 RUN chmod +x setup.sh \
@@ -59,7 +59,7 @@ RUN install -d ${OUT}/nuclei-templates \
  && nuclei -silent -update-templates -ut ${OUT}/nuclei-templates || true
 
 # ------------------------------------------------------------
-# Ruby (ruby-build) — version pin
+# Ruby 
 # ------------------------------------------------------------
 ARG RUBY_PREFIX=/opt/darkmoon/ruby
 ARG RUBY_VERSION=3.3.5
@@ -83,6 +83,19 @@ RUN curl -fsSL https://www.python.org/ftp/python/${PY_VER}/Python-${PY_VER}.tgz 
  && cd Python-${PY_VER} \
  && ./configure --prefix=${PY_PREFIX} --enable-optimizations --with-ensurepip=install \
  && make -j$(nproc) && make install
+
+# ------------------------------------------------------------
+# Rust
+# ------------------------------------------------------------
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable \
+ && . "$HOME/.cargo/env"
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# ------------------------------------------------------------
+# Python tooling
+# ------------------------------------------------------------
+COPY setup_py.sh /setup_py.sh
+RUN chmod +x /setup_py.sh && /setup_py.sh
 
 # ------------------------------------------------------------
 # SecLists
@@ -120,14 +133,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 # ------------------------------------------------------------
-# Core artefacts
+# Core artefacts copiés depuis builder
+# ------------------------------------------------------------
+# /out/bin/*                → Tous les binaires et wrappers (Go, Python, Ruby)
+# /out/seclists             → Wordlists SecLists
+# /out/nuclei-templates     → Templates Nuclei
+# /opt/darkmoon/python      → Python 3.12.6 custom compilé
+# /opt/darkmoon/ruby        → Ruby 3.3.5 custom compilé
+# /opt/darkmoon/curl        → libcurl custom compilé
+# /opt/darkmoon/finalrecon  → FinalRecon source
+# /opt/darkmoon/whatweb     → WhatWeb source
 # ------------------------------------------------------------
 COPY --from=builder /out /out
 COPY --from=builder /opt/darkmoon /opt/darkmoon
 
-# curl custom
+# ------------------------------------------------------------
+# Environment runtime : PATH et library paths
+# ------------------------------------------------------------
 ENV PATH="/opt/darkmoon/curl/bin:/opt/darkmoon/python/bin:/opt/darkmoon/ruby/bin:${PATH}" \
-    LD_LIBRARY_PATH="/opt/darkmoon/curl/lib"
+    LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:/opt/darkmoon/curl/lib:/opt/darkmoon/python/lib:/opt/darkmoon/ruby/lib"
+
+RUN ln -s /opt/darkmoon/python/bin/python3 /usr/local/bin/python \
+ && ln -s /opt/darkmoon/python/bin/pip3 /usr/local/bin/pip
 
 # ------------------------------------------------------------
 # Wordlists & data
@@ -142,18 +169,21 @@ ENV SECLISTS=/usr/share/seclists \
     NUCLEI_TEMPLATES=${DM_HOME}/nuclei-templates
 
 # ------------------------------------------------------------
-# Python tooling
+# Binary and wrapper installations
 # ------------------------------------------------------------
-COPY setup_py.sh /setup_py.sh
-RUN chmod +x /setup_py.sh && /setup_py.sh
+# Validation que /out/bin contient des binaires
+RUN test -d /out/bin || { echo "ERROR: /out/bin directory not found"; exit 1; } \
+ && test "$(ls -A /out/bin 2>/dev/null)" || { echo "ERROR: /out/bin is empty"; exit 1; }
 
-# ------------------------------------------------------------
-# Kube / recon tools
-# ------------------------------------------------------------
+# Binary installation Go/Python/Ruby in /usr/local/bin
 RUN for bin in /out/bin/*; do \
       name="$(basename "$bin")"; \
       install -m 755 "$bin" "/usr/local/bin/$name"; \
     done
+
+# Post-install validation
+RUN command -v nuclei >/dev/null || { echo "ERROR: nuclei not found in PATH"; exit 1; } \
+ && command -v finalrecon >/dev/null || { echo "ERROR: finalrecon not found in PATH"; exit 1; }
 
 # ------------------------------------------------------------
 # Nuclei bootstrap
@@ -163,7 +193,7 @@ RUN mkdir -p /root/nuclei-templates \
  && nuclei -tl >/dev/null 2>&1 || true
 
 # ------------------------------------------------------------
-# Hardening / réduction surface
+# Hardening 
 # ------------------------------------------------------------
 RUN apt-get purge -y login passwd libpam* gnupg* apt || true \
  && rm -rf /etc/apt /var/lib/apt /var/cache/apt

@@ -55,20 +55,29 @@ rm -f "$TMP_KUBELETCTL"
 # 2) ---- kubescape — DOC OFFICIELLE: install.sh ----
 msg "kubescape …"
 
-TMP_KUBESCAPE_DIR="$(mktemp -d)"
+KUBESCAPE_VERSION="v3.0.9"
+curl -fsSL \
+  "https://github.com/kubescape/kubescape/releases/download/${KUBESCAPE_VERSION}/kubescape-ubuntu-latest" \
+  -o /tmp/kubescape
 
-curl -fsSL https://raw.githubusercontent.com/kubescape/kubescape/master/install.sh \
-  | bash -s -- -b "$TMP_KUBESCAPE_DIR"
+chmod +x /tmp/kubescape
+install -D -m0755 /tmp/kubescape "$BIN_OUT/kubescape"
 
-if [ -x "$TMP_KUBESCAPE_DIR/kubescape" ]; then
-  install -D -m0755 "$TMP_KUBESCAPE_DIR/kubescape" "$BIN_OUT/kubescape"
-  ok "kubescape install (official install.sh)"
+ok "kubescape ${KUBESCAPE_VERSION}"
+
+# kubectl-who-can
+
+msg "kubectl-who-can …"
+
+go install github.com/aquasecurity/kubectl-who-can/cmd/kubectl-who-can@latest
+
+WHOCAN_BIN="$(go env GOPATH)/bin/kubectl-who-can"
+if [ -x "$WHOCAN_BIN" ]; then
+  install -D -m0755 "$WHOCAN_BIN" "$BIN_OUT/kubectl-who-can"
+  ok "kubectl-who-can install"
 else
-  warn "kubescape KO (binaire introuvable)"
+  warn "kubectl-who-can KO"
 fi
-
-rm -rf "$TMP_KUBESCAPE_DIR"
-
 
 # 3) ---- rbac-police — DOC OFFICIELLE: go install ----
 msg "rbac-police …"
@@ -151,7 +160,17 @@ fi
 
 # 10) ffuf — fuzzer / directory & parameter discovery
 msg "ffuf …"
-go_build_with_pins "https://github.com/ffuf/ffuf" "." "ffuf" || warn "ffuf KO"
+GO111MODULE=on GOTOOLCHAIN=local \
+  go install github.com/ffuf/ffuf/v2@latest
+
+FFUF_BIN="$(go env GOPATH)/bin/ffuf"
+if [ -x "$FFUF_BIN" ]; then
+  install -D -m0755 "$FFUF_BIN" "$BIN_OUT/ffuf"
+  ok "ffuf install (go install)"
+else
+  warn "ffuf KO (binaire introuvable)"
+  exit 1
+fi
 
 # 11) subfinder — DOC OFFICIELLE: go install (module v2)
 msg "subfinder …"
@@ -267,6 +286,17 @@ else
   warn "waybackurls KO (binaire introuvable)"
 fi
 
-# Récapitulatif
+# Récapitulatif et validation
 msg "Binaires installés dans $BIN_OUT :"
 ls -lh "$BIN_OUT" || true
+
+# Validation stricte : vérifier qu'au moins 10 binaires ont été installés
+BINARY_COUNT=$(find "$BIN_OUT" -type f -executable | wc -l)
+MIN_EXPECTED=10
+
+if [ "$BINARY_COUNT" -lt "$MIN_EXPECTED" ]; then
+  warn "ERREUR: Seulement $BINARY_COUNT binaires trouvés dans $BIN_OUT (minimum attendu: $MIN_EXPECTED)"
+  exit 1
+fi
+
+ok "Validation réussie: $BINARY_COUNT binaires installés"
