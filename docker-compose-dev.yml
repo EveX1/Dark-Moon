@@ -59,4 +59,4 @@ services:
       # 🔽 TEST runtime variables LLM conf
       - OPENROUTER_PROVIDER=anthropic
       - OPENCODE_MODEL=claude-opus-4-6
-      - OPENROUTER_API_KEY=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
+      - OPENROUTER_API_KEY=sk-ant-xxx
